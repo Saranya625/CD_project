@@ -1,0 +1,74 @@
+
+int main() {
+    // Variable declarations
+    int x;
+    decimal pi;
+    char grade;
+    
+    // Array and matrix declarations
+    int numbers[5];
+    matrix m[3][3];
+    
+    // Assignments
+    x = 10;
+    pi = 3.14159;
+    grade = 'A';
+    
+    // Array operations
+    numbers[0] = 100;
+    numbers[1] = 200;
+    
+    // Matrix operations
+    m[0][0] = 1;
+    m[0][1] = 2;
+    m[1][0] = 3;
+    m[1][1] = 4;
+    
+    // Arithmetic expressions
+    x = x + 5;
+    x = x * 2;
+    x = x % 3;
+    
+    // Logical and relational operations
+    if (x > 0 && x < 100) {
+        print("x is in range");
+    }
+    
+    // Switch statement
+    switch (x) {
+        case 1:
+            print("One");
+            break;
+        case 2:
+            print("Two");
+            break;
+        default:
+            print("Other");
+            break;
+    }
+    
+    // While loop with continue
+    x = 0;
+    while (x < 10) {
+        x = x + 1;
+        if (x == 5) {
+            continue;
+        }
+        print("x = ", x);
+    }
+    
+    // For loop with break
+    for (x = 0; x < 20; x = x + 1) {
+        if (x == 15) {
+            break;
+        }
+        print("Loop iteration: ", x);
+    }
+    
+    // Input/Output
+    print("Enter a number:");
+    scan(x);
+    print("You entered:", x);
+    
+    return 0;
+}

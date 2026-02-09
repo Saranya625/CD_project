@@ -1,0 +1,22 @@
+int global_x = 100;
+decimal global_pi = 3.14;
+int global_array[10];
+
+int main() {
+    int local_y;
+    
+    // Use global variables
+    local_y = global_x + 50;
+    print("Global x:", global_x);
+    print("Local y:", local_y);
+    
+    // Modify global array
+    global_array[0] = 10;
+    global_array[1] = 20;
+    global_array[2] = 30;
+    
+    print("Global array elements:");
+    print(global_array[0], global_array[1], global_array[2]);
+    
+    return 0;
+}
