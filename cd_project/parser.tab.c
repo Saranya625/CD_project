@@ -1566,7 +1566,7 @@ void yyerror(const char *s) {
 }
 
 int main() {
-    printf("Starting parser...\n");
+   printf("--- Tokens Generated ---\n");
     if (yyparse() == 0) {
         printf("Parsing completed successfully.\n");
     } else {

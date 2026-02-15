@@ -2,68 +2,70 @@
 #include "parser.tab.h"
 #include <stdio.h>
 int line_no = 1;
-%}
 
+void print_token(const char* token_type, const char* lexeme) {
+    printf("%-20s: %s\n", token_type, lexeme);
+}
+%}
 
 DIGIT       [0-9]
 LETTER      [a-zA-Z_]
 ID          {LETTER}({LETTER}|{DIGIT})*
 INTC        {DIGIT}+
 DECIMALC    {DIGIT}+\.{DIGIT}+
-CHARC       '.'
-STRING      \"[^\"]*\"
-
+CHARC       '([^'\\]|\\.)'
+STRING      \"([^\"\\]|\\.)*\"
 
 %%
-"int"       { return KEYWORD_INT; }
-"decimal"   { return KEYWORD_DECIMAL; }
-"char"      { return KEYWORD_CHAR; }
-"matrix"    { return KEYWORD_MATRIX; }
-"main"      { return KEYWORD_MAIN; }
-"if"        { return KEYWORD_IF; }
-"else"      { return KEYWORD_ELSE; }
-"for"       { return KEYWORD_FOR; }
-"while"     { return KEYWORD_WHILE; }
-"switch"    { return KEYWORD_SWITCH; }
-"case"      { return KEYWORD_CASE; }
-"default"   { return KEYWORD_DEFAULT; }
-"break"     { return KEYWORD_BREAK; }
-"continue"  { return KEYWORD_CONTINUE; }
-"return"    { return KEYWORD_RETURN; }
-"print"     { return KEYWORD_PRINT; }
-"scan"      { return KEYWORD_SCAN; }
+"int"       { print_token("KEYWORD_INT", yytext); return KEYWORD_INT; }
+"decimal"   { print_token("KEYWORD_DECIMAL", yytext); return KEYWORD_DECIMAL; }
+"char"      { print_token("KEYWORD_CHAR", yytext); return KEYWORD_CHAR; }
+"matrix"    { print_token("KEYWORD_MATRIX", yytext); return KEYWORD_MATRIX; }
+"main"      { print_token("KEYWORD_MAIN", yytext); return KEYWORD_MAIN; }
+"if"        { print_token("KEYWORD_IF", yytext); return KEYWORD_IF; }
+"else"      { print_token("KEYWORD_ELSE", yytext); return KEYWORD_ELSE; }
+"for"       { print_token("KEYWORD_FOR", yytext); return KEYWORD_FOR; }
+"while"     { print_token("KEYWORD_WHILE", yytext); return KEYWORD_WHILE; }
+"switch"    { print_token("KEYWORD_SWITCH", yytext); return KEYWORD_SWITCH; }
+"case"      { print_token("KEYWORD_CASE", yytext); return KEYWORD_CASE; }
+"default"   { print_token("KEYWORD_DEFAULT", yytext); return KEYWORD_DEFAULT; }
+"break"     { print_token("KEYWORD_BREAK", yytext); return KEYWORD_BREAK; }
+"continue"  { print_token("KEYWORD_CONTINUE", yytext); return KEYWORD_CONTINUE; }
+"return"    { print_token("KEYWORD_RETURN", yytext); return KEYWORD_RETURN; }
+"print"     { print_token("KEYWORD_PRINT", yytext); return KEYWORD_PRINT; }
+"scan"      { print_token("KEYWORD_SCAN", yytext); return KEYWORD_SCAN; }
 
-"=="        { return OP_EQ; }
-"!="        { return OP_NE; }
-"<="        { return OP_LE; }
-">="        { return OP_GE; }
-"<"         { return OP_LT; }
-">"         { return OP_GT; }
-"&&"        { return OP_AND; }
-"||"        { return OP_OR; }
-"!"         { return OP_NOT; }
-"+"         { return OP_PLUS; }
-"-"         { return OP_MINUS; }
-"*"         { return OP_MUL; }
-"/"         { return OP_DIV; }
-"%"         { return OP_MOD; }
-"="         { return OP_ASSIGN; }
+"=="        { print_token("OP_EQ", yytext); return OP_EQ; }
+"!="        { print_token("OP_NE", yytext); return OP_NE; }
+"<="        { print_token("OP_LE", yytext); return OP_LE; }
+">="        { print_token("OP_GE", yytext); return OP_GE; }
+"<"         { print_token("OP_LT", yytext); return OP_LT; }
+">"         { print_token("OP_GT", yytext); return OP_GT; }
+"&&"        { print_token("OP_AND", yytext); return OP_AND; }
+"||"        { print_token("OP_OR", yytext); return OP_OR; }
+"!"         { print_token("OP_NOT", yytext); return OP_NOT; }
+"+"         { print_token("OP_PLUS", yytext); return OP_PLUS; }
+"-"         { print_token("OP_MINUS", yytext); return OP_MINUS; }
+"*"         { print_token("OP_MUL", yytext); return OP_MUL; }
+"/"         { print_token("OP_DIV", yytext); return OP_DIV; }
+"%"         { print_token("OP_MOD", yytext); return OP_MOD; }
+"="         { print_token("OP_ASSIGN", yytext); return OP_ASSIGN; }
 
-";"         { return DELIM_SEMI; }
-","         { return DELIM_COMMA; }
-":"         { return DELIM_COLON; }
-"("         { return DELIM_LPAREN; }
-")"         { return DELIM_RPAREN; }
-"{"         { return DELIM_LBRACE; }
-"}"         { return DELIM_RBRACE; }
-"["         { return DELIM_LBRACK; }
-"]"         { return DELIM_RBRACK; }
+";"         { print_token("DELIM_SEMI", yytext); return DELIM_SEMI; }
+","         { print_token("DELIM_COMMA", yytext); return DELIM_COMMA; }
+":"         { print_token("DELIM_COLON", yytext); return DELIM_COLON; }
+"("         { print_token("DELIM_LPAREN", yytext); return DELIM_LPAREN; }
+")"         { print_token("DELIM_RPAREN", yytext); return DELIM_RPAREN; }
+"{"         { print_token("DELIM_LBRACE", yytext); return DELIM_LBRACE; }
+"}"         { print_token("DELIM_RBRACE", yytext); return DELIM_RBRACE; }
+"["         { print_token("DELIM_LBRACK", yytext); return DELIM_LBRACK; }
+"]"         { print_token("DELIM_RBRACK", yytext); return DELIM_RBRACK; }
 
-{DECIMALC}  { return DECIMAL_CONST; }
-{INTC}      { return INT_CONST; }
-{CHARC}     { return CHAR_CONST; }
-{STRING}    { return STRING; }
-{ID}        { return ID; }
+{DECIMALC}  { print_token("DECIMAL_CONST", yytext); return DECIMAL_CONST; }
+{INTC}      { print_token("INT_CONST", yytext); return INT_CONST; }
+{CHARC}     { print_token("CHAR_CONST", yytext); return CHAR_CONST; }
+{STRING}    { print_token("STRING", yytext); return STRING; }
+{ID}        { print_token("ID", yytext); return ID; }
 
 "//".*      { /* Single-line comment - ignore */ }
 "/*"        { /* Multi-line comment start */
@@ -85,3 +87,14 @@ STRING      \"[^\"]*\"
 int yywrap() { 
     return 1; 
 }
+
+#ifdef LEXER_STANDALONE
+int main() {
+    int token;
+    printf("=== LEXICAL ANALYSIS ===\n");
+    while ((token = yylex())) {
+        // Tokens already printed by print_token()
+    }
+    return 0;
+}
+#endif
