@@ -17,9 +17,7 @@ CHARC       '([^'\\]|\\.)'
 STRING      \"([^\"\\]|\\.)*\"
 
 %%
-"int"       { print_token("KEYWORD_INT", yytext); return KEYWORD_INT; }
-"decimal"   { print_token("KEYWORD_DECIMAL", yytext); return KEYWORD_DECIMAL; }
-"char"      { print_token("KEYWORD_CHAR", yytext); return KEYWORD_CHAR; }
+"array"     { print_token("KEYWORD_ARR", yytext); return KEYWORD_ARR; }
 "matrix"    { print_token("KEYWORD_MATRIX", yytext); return KEYWORD_MATRIX; }
 "main"      { print_token("KEYWORD_MAIN", yytext); return KEYWORD_MAIN; }
 "if"        { print_token("KEYWORD_IF", yytext); return KEYWORD_IF; }
@@ -44,12 +42,23 @@ STRING      \"([^\"\\]|\\.)*\"
 "&&"        { print_token("OP_AND", yytext); return OP_AND; }
 "||"        { print_token("OP_OR", yytext); return OP_OR; }
 "!"         { print_token("OP_NOT", yytext); return OP_NOT; }
+"++"        { print_token("OP_INC", yytext); return OP_INC; }
+"--"        { print_token("OP_DEC", yytext); return OP_DEC; }
 "+"         { print_token("OP_PLUS", yytext); return OP_PLUS; }
 "-"         { print_token("OP_MINUS", yytext); return OP_MINUS; }
 "*"         { print_token("OP_MUL", yytext); return OP_MUL; }
 "/"         { print_token("OP_DIV", yytext); return OP_DIV; }
 "%"         { print_token("OP_MOD", yytext); return OP_MOD; }
 "="         { print_token("OP_ASSIGN", yytext); return OP_ASSIGN; }
+".size"     { print_token("OP_SIZE", yytext); return OP_SIZE; }
+".sort"     { print_token("OP_SORT", yytext); return OP_SORT; }
+".add"      { print_token("OP_MATADD", yytext); return OP_MATADD; }
+".sub"      { print_token("OP_MATSUB", yytext); return OP_MATSUB; }
+".mul"      { print_token("OP_MATMUL", yytext); return OP_MATMUL; }
+".det"      { print_token("OP_MATDET", yytext); return OP_MATDET; }
+".inv"      { print_token("OP_MATINV", yytext); return OP_MATINV; }
+".shape"    { print_token("OP_MATSHAPE", yytext); return OP_MATSHAPE; }
+".T"        { print_token("OP_MATTRANSPOSE", yytext); return OP_MATTRANSPOSE; }
 
 ";"         { print_token("DELIM_SEMI", yytext); return DELIM_SEMI; }
 ","         { print_token("DELIM_COMMA", yytext); return DELIM_COMMA; }
@@ -79,7 +88,7 @@ STRING      \"([^\"\\]|\\.)*\"
                 }
             }
 
-[ \t]+      { /* Ignore whitespace */ }
+[ \t\r]+      { /* Ignore whitespace */ }
 \n          { line_no++; }
 .           { printf("Lexical Error at line %d: %s\n", line_no, yytext); }
 %%

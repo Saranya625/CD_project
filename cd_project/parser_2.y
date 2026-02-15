@@ -1,20 +1,11 @@
-%code requires {
-    #include "ast.h"
-}
-
 %{
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <string.h>
-    #include "ast.h"
+#include <stdio.h>
+#include <stdlib.h>
 
-    extern int line_no;
-    extern int yylex();
-    void yyerror(const char *s);
-
-    ASTNode* root;
+extern int line_no;
+extern int yylex();
+void yyerror(const char *s);
 %}
-
 
 /* ---------- Token Definitions ---------- */
 %token KEYWORD_MATRIX KEYWORD_ARR
@@ -35,37 +26,7 @@
 %token DELIM_LPAREN DELIM_RPAREN
 %token DELIM_LBRACE DELIM_RBRACE
 %token DELIM_LBRACK DELIM_RBRACK
-%token <str> ID INT_CONST DECIMAL_CONST CHAR_CONST STRING
-
-%union {
-    ASTNode *node;
-    char *str;
-}
-
-%type <node> program
-%type <node> global_declarations
-%type <node> global_declaration
-%type <node> block
-%type <node> statements
-%type <node> statement
-%type <node> declaration
-%type <node> assignment
-%type <node> if_statement
-%type <node> for_loop
-%type <node> while_loop
-%type <node> assignment_expr
-%type <node> expression
-%type <node> logical_or_expression
-%type <node> logical_and_expression
-%type <node> equality_expression
-%type <node> relational_expression
-%type <node> additive_expression
-%type <node> multiplicative_expression
-%type <node> unary_expression
-%type <node> postfix_expression
-%type <node> primary_expression
-%type <node> constant
-
+%token INT_CONST DECIMAL_CONST CHAR_CONST STRING ID
 
 /* ---------- Operator Precedence ---------- */
 %right OP_ASSIGN
@@ -83,52 +44,31 @@
 
 program:
     global_declarations KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
-    { $$ = createNode("program", NULL, $1, $5, NULL);    root = $$; }
-
+    { printf("Valid program parsed successfully!\n"); }
     | KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
-    { $$ = createNode("program", NULL, NULL, $4, NULL);   root = $$; }
+    { printf("Valid program parsed successfully!\n"); }
     ;
 
 global_declarations:
-    global_declaration  
-    { $$ = $1; }
-
+    global_declaration
     | global_declarations global_declaration
-    { $$ = createNode("global", NULL, $1, $2, NULL); }
     ;
 
 /*Only allowing matrix and array keywords for declaration*/
 global_declaration:
     KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
-    {
-        $$ = createNode("matrix_decl", $2,
-                createNode("rows", $4, NULL, NULL, NULL),
-                createNode("cols", $7, NULL, NULL, NULL), NULL);
-    }
-    
     | KEYWORD_ARR ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
-    {
-        $$ = createNode("array_decl", $2,
-                createNode("size", $4, NULL, NULL, NULL), NULL, NULL);
-    }
-
     | ID OP_ASSIGN expression DELIM_SEMI
-    { $$ = createNode("assign", $1, $3, NULL, NULL); }
     ;
 
 block:
     DELIM_LBRACE statements DELIM_RBRACE
-    { $$ = createNode("block", NULL, $2, NULL, NULL); }
-
     | DELIM_LBRACE DELIM_RBRACE
-    { $$ = createNode("block", NULL, NULL, NULL, NULL); }
     ;
 
 statements:
-    statement   { $$ = $1; }
-
+    statement
     | statements statement
-    { $$ = createNode("statements", NULL, $1, $2, NULL); }
     ;
 
 statement:
@@ -148,62 +88,27 @@ statement:
 
 declaration:
     KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
-    {
-        $$ = createNode("matrix_decl", $2,
-                createNode("rows", $4, NULL, NULL, NULL),
-                createNode("cols", $7, NULL, NULL, NULL), NULL);
-    }
-
     | KEYWORD_ARR ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
-    {
-        $$ = createNode("array_decl", $2,
-                createNode("size", $4, NULL, NULL, NULL), NULL, NULL);
-    }
     ;
 
 assignment:
-    ID OP_ASSIGN expression DELIM_SEMI 
-    {$$ = createNode("assign", $1, $3, NULL, NULL);}
-
+    ID OP_ASSIGN expression DELIM_SEMI
     | ID DELIM_LBRACK expression DELIM_RBRACK OP_ASSIGN expression DELIM_SEMI
-    {
-        $$ = createNode("assign", NULL,
-                createNode("array_access", $1, $3, NULL, NULL), $6, NULL);
-    }
-
-
     | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK OP_ASSIGN expression DELIM_SEMI
-    {
-        $$ = createNode("assign", NULL,
-                createNode("matrix_access", $1, $3, $6, NULL), $9, NULL);
-    }
     ;
 
 if_statement:
     KEYWORD_IF DELIM_LPAREN expression DELIM_RPAREN block
-    { $$ = createNode("if", NULL, $3, $5, NULL); }
-
     | KEYWORD_IF DELIM_LPAREN expression DELIM_RPAREN block KEYWORD_ELSE block
-    { $$ = createNode("if_else", NULL, $3, $5, $7); }
-
     | KEYWORD_IF DELIM_LPAREN expression DELIM_RPAREN block KEYWORD_ELSE if_statement
-    {
-        $$ = createNode("if_else", NULL,
-                createNode("if", NULL, $3, $5, NULL), $7, NULL);
-    }
     ;
 
 for_loop:
     KEYWORD_FOR DELIM_LPAREN assignment_expr DELIM_SEMI expression DELIM_SEMI assignment_expr DELIM_RPAREN block
-    {
-        $$ = createNode("for_body", NULL, 
-                createNode("for", NULL, $3, $5, $7), $9, NULL); 
-    }
     ;
 
 while_loop:
     KEYWORD_WHILE DELIM_LPAREN expression DELIM_RPAREN block
-    { $$ = createNode("while", NULL, $3, $5, NULL); }
     ;
 
 switch_statement:
@@ -273,190 +178,80 @@ expression:
     ;
 
 logical_or_expression:
-    logical_and_expression
-    { $$ = $1; }
-
+      logical_and_expression
     | logical_or_expression OP_OR logical_and_expression
-    { $$ = createNode("or", NULL, $1, $3, NULL); }
     ;
 
 logical_and_expression:
-    equality_expression
-    { $$ = $1; }
+      equality_expression
     | logical_and_expression OP_AND equality_expression
-    { $$ = createNode("and", NULL, $1, $3, NULL); }
     ;
 
 equality_expression:
-    relational_expression
-    { $$ = $1; }
-
+      relational_expression
     | equality_expression OP_EQ relational_expression
-    { $$ = createNode("eq", NULL, $1, $3, NULL); }
-
     | equality_expression OP_NE relational_expression
-    { $$ = createNode("ne", NULL, $1, $3, NULL); }
     ;
 
 relational_expression:
-    additive_expression
-    { $$ = $1; }
-
+      additive_expression
     | relational_expression OP_LT additive_expression
-    { $$ = createNode("lt", NULL, $1, $3, NULL); }
-
     | relational_expression OP_GT additive_expression
-    { $$ = createNode("gt", NULL, $1, $3, NULL); }
-    
     | relational_expression OP_LE additive_expression
-    { $$ = createNode("le", NULL, $1, $3, NULL); }
-
     | relational_expression OP_GE additive_expression
-    { $$ = createNode("ge", NULL, $1, $3, NULL); }
     ;
 
 additive_expression:
-    multiplicative_expression 
-    { $$ = $1; }
-
+      multiplicative_expression
     | additive_expression OP_PLUS multiplicative_expression
-    { $$ = createNode("+", NULL, $1, $3, NULL); }
-
     | additive_expression OP_MINUS multiplicative_expression
-    { $$ = createNode("-", NULL, $1, $3, NULL); }
     ;
 
 multiplicative_expression:
-    unary_expression
-    { $$ = $1; }
-
+      unary_expression
     | multiplicative_expression OP_MUL unary_expression
-    { $$ = createNode("*", NULL, $1, $3, NULL); }
-
     | multiplicative_expression OP_DIV unary_expression
-    { $$ = createNode("/", NULL, $1, $3, NULL); }
-
     | multiplicative_expression OP_MOD unary_expression
-    { $$ = createNode("%", NULL, $1, $3, NULL); }
     ;
 
 unary_expression:
-    postfix_expression   
-    { $$ = $1; }
-
+      postfix_expression
     | OP_NOT unary_expression
-    { $$ = createNode("not", NULL, $2, NULL, NULL); }
-
     | OP_MINUS unary_expression %prec UMINUS
-    { $$ = createNode("uminus", NULL, $2, NULL, NULL); }
-
     | OP_INC unary_expression
-    { $$ = createNode("pre_inc", NULL, $2, NULL, NULL); }
-
     | OP_DEC unary_expression
-    { $$ = createNode("pre_dec", NULL, $2, NULL, NULL); }
     ;
 
 postfix_expression:
-    primary_expression
-    { $$ = $1; }
-
+      primary_expression
     | postfix_expression OP_SIZE
-    { $$ = createNode("size", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_SORT
-    { $$ = createNode("sort", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_MATTRANSPOSE
-    { $$ = createNode("transpose", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_MATDET
-    { $$ = createNode("det", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_MATINV
-    { $$ = createNode("inv", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_MATSHAPE
-    { $$ = createNode("shape", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_MATADD DELIM_LPAREN expression DELIM_RPAREN
-    { $$ = createNode("matadd", NULL, $1, $4, NULL); }
-
     | postfix_expression OP_MATSUB DELIM_LPAREN expression DELIM_RPAREN
-    { $$ = createNode("matmul", NULL, $1, $4, NULL); }
-
     | postfix_expression OP_MATMUL DELIM_LPAREN expression DELIM_RPAREN
-    { $$ = createNode("matmul", NULL, $1, $4, NULL); }
-
     | postfix_expression OP_INC
-    { $$ = createNode("post_inc", NULL, $1, NULL, NULL); }
-
     | postfix_expression OP_DEC
-    { $$ = createNode("post_dec", NULL, $1, NULL, NULL); }
     ;
 
 primary_expression:
-    constant
+      constant
     | ID
-    { $$ = createNode("id", $1, NULL, NULL, NULL); }
-
     | ID DELIM_LBRACK expression DELIM_RBRACK
-    { $$ = createNode("array_access", $1, $3, NULL, NULL); }
-
     | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK
-    { $$ = createNode("matrix_access", $1, $3, $6, NULL); }
-
     | DELIM_LPAREN expression DELIM_RPAREN
-    { $$ = $2; }
     ;
 
 constant:
     INT_CONST
-    { $$ = createNode("int", $1, NULL, NULL, NULL); }
-
     | DECIMAL_CONST
-    { $$ = createNode("decimal", $1, NULL, NULL, NULL); }
-
     | CHAR_CONST
-    { $$ = createNode("char", $1, NULL, NULL, NULL); }
     ;
 
 %%
-
-ASTNode* createNode(char *type, char *value, ASTNode *left, ASTNode *right, ASTNode *third)
-{
-    ASTNode *node = malloc(sizeof(ASTNode));
-    node->type = type;
-    node->value = value;
-    node->left = left;
-    node->right = right;
-    node->third = third;
-    return node;
-}
-
-void printIndent(int level)
-{
-    for (int i = 0; i < level; i++)
-        printf("|   ");
-}
-
-void printAST(ASTNode* node, int level)
-{
-    if (node == NULL)
-        return;
-
-    printIndent(level);
-
-    if (node->value)
-        printf("|-- %s (%s)\n", node->type, node->value);
-    else
-        printf("|-- %s\n", node->type);
-
-    printAST(node->left, level + 1);
-    printAST(node->right, level + 1);
-    printAST(node->third, level + 1);
-}
-
 
 void yyerror(const char *s) {
     fprintf(stderr, "Parse error at line %d: %s\n", line_no, s);
@@ -470,6 +265,5 @@ int main() {
     } else {
         printf("Parsing failed.\n");
     }
-    printAST(root, 0);
     return 0;
 }

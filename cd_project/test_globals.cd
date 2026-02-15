@@ -1,9 +1,8 @@
-int global_x = 100;
-decimal global_pi = 3.14;
-int global_array[10];
+global_x = 100;
+global_pi = 3.14;
+array global_array[10];
 
-int main() {
-    int local_y;
+main() {
     
     // Use global variables
     local_y = global_x + 50;
