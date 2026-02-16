@@ -17,6 +17,10 @@ CHARC       '([^'\\]|\\.)'
 STRING      \"([^\"\\]|\\.)*\"
 
 %%
+"int"       { print_token("KEYWORD_INT", yytext); return KEYWORD_INT; }
+"decimal"   { print_token("KEYWORD_DECIMAL", yytext); return KEYWORD_DECIMAL; }
+"char"      { print_token("KEYWORD_CHAR", yytext); return KEYWORD_CHAR; }
+"string"    { print_token("KEYWORD_STRING", yytext); return KEYWORD_STRING; }
 "array"     { print_token("KEYWORD_ARR", yytext); return KEYWORD_ARR; }
 "matrix"    { print_token("KEYWORD_MATRIX", yytext); return KEYWORD_MATRIX; }
 "main"      { print_token("KEYWORD_MAIN", yytext); return KEYWORD_MAIN; }

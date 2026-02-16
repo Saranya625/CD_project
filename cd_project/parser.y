@@ -17,7 +17,7 @@
 
 
 /* ---------- Token Definitions ---------- */
-%token KEYWORD_MATRIX KEYWORD_ARR
+%token KEYWORD_INT KEYWORD_DECIMAL KEYWORD_CHAR KEYWORD_MATRIX KEYWORD_ARR
 %token KEYWORD_MAIN KEYWORD_IF KEYWORD_ELSE
 %token KEYWORD_FOR KEYWORD_WHILE
 %token KEYWORD_SWITCH KEYWORD_CASE KEYWORD_DEFAULT
@@ -45,6 +45,7 @@
 %type <node> program
 %type <node> global_declarations
 %type <node> global_declaration
+%type <str> type_specifier
 %type <node> block
 %type <node> statements
 %type <node> statement
@@ -82,11 +83,18 @@
 %%
 
 program:
-    global_declarations KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
-    { $$ = createNode("program", NULL, $1, $5, NULL);    root = $$; }
+    global_declarations KEYWORD_INT KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
+    { 
+        $$ = createNode("program", NULL, $1, $6, NULL); 
+        root = $$;  
+    }
 
-    | KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
-    { $$ = createNode("program", NULL, NULL, $4, NULL);   root = $$; }
+    | KEYWORD_INT KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
+    { 
+        $$ = createNode("program", NULL, NULL, $5, NULL); 
+        root = $$;
+    }
+
     ;
 
 global_declarations:
@@ -99,7 +107,21 @@ global_declarations:
 
 /*Only allowing matrix and array keywords for declaration*/
 global_declaration:
-    KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
+    type_specifier ID DELIM_SEMI
+    {
+        $$ = createNode("decl", NULL,
+                createNode("type", $1, NULL, NULL, NULL),
+                createNode("id", $2, NULL, NULL, NULL), NULL);
+    }
+
+    | type_specifier ID OP_ASSIGN constant DELIM_SEMI
+    {
+        $$ = createNode("decl_assign", NULL,
+                createNode("type", $1, NULL, NULL, NULL),
+                createNode("id", $2, NULL, NULL, NULL), $4);
+    }
+
+    | KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
     {
         $$ = createNode("matrix_decl", $2,
                 createNode("rows", $4, NULL, NULL, NULL),
@@ -114,6 +136,12 @@ global_declaration:
 
     | ID OP_ASSIGN expression DELIM_SEMI
     { $$ = createNode("assign", $1, $3, NULL, NULL); }
+    ;
+
+type_specifier:
+    KEYWORD_INT         { $$ = "int"; }
+    | KEYWORD_DECIMAL   { $$ = "decimal"; }
+    | KEYWORD_CHAR      { $$ = "char"; }
     ;
 
 block:
@@ -147,7 +175,21 @@ statement:
     ;
 
 declaration:
-    KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
+    type_specifier ID DELIM_SEMI
+    {
+        $$ = createNode("decl", NULL,
+                createNode("type", $1, NULL, NULL, NULL),
+                createNode("id", $2, NULL, NULL, NULL), NULL);
+    }
+
+    | type_specifier ID OP_ASSIGN expression DELIM_SEMI
+    {
+        $$ = createNode("decl_assign", NULL,
+                createNode("type", $1, NULL, NULL, NULL),
+                createNode("id", $2, NULL, NULL, NULL), $4);
+    }
+
+    | KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
     {
         $$ = createNode("matrix_decl", $2,
                 createNode("rows", $4, NULL, NULL, NULL),
@@ -160,6 +202,7 @@ declaration:
                 createNode("size", $4, NULL, NULL, NULL), NULL, NULL);
     }
     ;
+
 
 assignment:
     ID OP_ASSIGN expression DELIM_SEMI 
@@ -263,8 +306,22 @@ lvalue:
 
 assignment_expr:
     ID OP_ASSIGN expression
+    {
+        $$ = createNode("assign", NULL,
+                createNode("id", $1, NULL, NULL, NULL), $3, NULL);
+    }
+
     | ID DELIM_LBRACK expression DELIM_RBRACK OP_ASSIGN expression
+    {
+        $$ = createNode("assign", NULL,
+                createNode("array_access", $1, $3, NULL, NULL), $6, NULL);
+    }
+
     | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK OP_ASSIGN expression
+    {
+        $$ = createNode("assign", NULL,
+                createNode("matrix_access", $1, $3, $6, NULL), $9, NULL);
+    }
     ;
 
 /* Divided the expression into sub expressions */
@@ -383,7 +440,7 @@ postfix_expression:
     { $$ = createNode("matadd", NULL, $1, $4, NULL); }
 
     | postfix_expression OP_MATSUB DELIM_LPAREN expression DELIM_RPAREN
-    { $$ = createNode("matmul", NULL, $1, $4, NULL); }
+    { $$ = createNode("matsub", NULL, $1, $4, NULL); }
 
     | postfix_expression OP_MATMUL DELIM_LPAREN expression DELIM_RPAREN
     { $$ = createNode("matmul", NULL, $1, $4, NULL); }

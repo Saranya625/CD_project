@@ -1,4 +1,4 @@
-main(){
+int main(){
     matrix A[3][3];
     matrix B[3][3];
 

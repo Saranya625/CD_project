@@ -1,5 +1,9 @@
-main() {
+int main() {
 
+    int i;
+    int j;
+    int temp;
+    int n;
     array a[10];
 
     print("Enter number of elements:");
@@ -26,5 +30,5 @@ main() {
         print(a[i]);
     }
 
-    return;
+    return 0;
 }

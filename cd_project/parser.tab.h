@@ -60,62 +60,65 @@ extern int yydebug;
     YYEOF = 0,                     /* "end of file"  */
     YYerror = 256,                 /* error  */
     YYUNDEF = 257,                 /* "invalid token"  */
-    KEYWORD_MATRIX = 258,          /* KEYWORD_MATRIX  */
-    KEYWORD_ARR = 259,             /* KEYWORD_ARR  */
-    KEYWORD_MAIN = 260,            /* KEYWORD_MAIN  */
-    KEYWORD_IF = 261,              /* KEYWORD_IF  */
-    KEYWORD_ELSE = 262,            /* KEYWORD_ELSE  */
-    KEYWORD_FOR = 263,             /* KEYWORD_FOR  */
-    KEYWORD_WHILE = 264,           /* KEYWORD_WHILE  */
-    KEYWORD_SWITCH = 265,          /* KEYWORD_SWITCH  */
-    KEYWORD_CASE = 266,            /* KEYWORD_CASE  */
-    KEYWORD_DEFAULT = 267,         /* KEYWORD_DEFAULT  */
-    KEYWORD_BREAK = 268,           /* KEYWORD_BREAK  */
-    KEYWORD_CONTINUE = 269,        /* KEYWORD_CONTINUE  */
-    KEYWORD_RETURN = 270,          /* KEYWORD_RETURN  */
-    KEYWORD_PRINT = 271,           /* KEYWORD_PRINT  */
-    KEYWORD_SCAN = 272,            /* KEYWORD_SCAN  */
-    OP_EQ = 273,                   /* OP_EQ  */
-    OP_NE = 274,                   /* OP_NE  */
-    OP_LE = 275,                   /* OP_LE  */
-    OP_GE = 276,                   /* OP_GE  */
-    OP_LT = 277,                   /* OP_LT  */
-    OP_GT = 278,                   /* OP_GT  */
-    OP_PLUS = 279,                 /* OP_PLUS  */
-    OP_MINUS = 280,                /* OP_MINUS  */
-    OP_MUL = 281,                  /* OP_MUL  */
-    OP_DIV = 282,                  /* OP_DIV  */
-    OP_MOD = 283,                  /* OP_MOD  */
-    OP_INC = 284,                  /* OP_INC  */
-    OP_DEC = 285,                  /* OP_DEC  */
-    OP_AND = 286,                  /* OP_AND  */
-    OP_OR = 287,                   /* OP_OR  */
-    OP_NOT = 288,                  /* OP_NOT  */
-    OP_ASSIGN = 289,               /* OP_ASSIGN  */
-    OP_SIZE = 290,                 /* OP_SIZE  */
-    OP_SORT = 291,                 /* OP_SORT  */
-    OP_MATADD = 292,               /* OP_MATADD  */
-    OP_MATSUB = 293,               /* OP_MATSUB  */
-    OP_MATMUL = 294,               /* OP_MATMUL  */
-    OP_MATTRANSPOSE = 295,         /* OP_MATTRANSPOSE  */
-    OP_MATDET = 296,               /* OP_MATDET  */
-    OP_MATINV = 297,               /* OP_MATINV  */
-    OP_MATSHAPE = 298,             /* OP_MATSHAPE  */
-    DELIM_SEMI = 299,              /* DELIM_SEMI  */
-    DELIM_COMMA = 300,             /* DELIM_COMMA  */
-    DELIM_COLON = 301,             /* DELIM_COLON  */
-    DELIM_LPAREN = 302,            /* DELIM_LPAREN  */
-    DELIM_RPAREN = 303,            /* DELIM_RPAREN  */
-    DELIM_LBRACE = 304,            /* DELIM_LBRACE  */
-    DELIM_RBRACE = 305,            /* DELIM_RBRACE  */
-    DELIM_LBRACK = 306,            /* DELIM_LBRACK  */
-    DELIM_RBRACK = 307,            /* DELIM_RBRACK  */
-    ID = 308,                      /* ID  */
-    INT_CONST = 309,               /* INT_CONST  */
-    DECIMAL_CONST = 310,           /* DECIMAL_CONST  */
-    CHAR_CONST = 311,              /* CHAR_CONST  */
-    STRING = 312,                  /* STRING  */
-    UMINUS = 313                   /* UMINUS  */
+    KEYWORD_INT = 258,             /* KEYWORD_INT  */
+    KEYWORD_DECIMAL = 259,         /* KEYWORD_DECIMAL  */
+    KEYWORD_CHAR = 260,            /* KEYWORD_CHAR  */
+    KEYWORD_MATRIX = 261,          /* KEYWORD_MATRIX  */
+    KEYWORD_ARR = 262,             /* KEYWORD_ARR  */
+    KEYWORD_MAIN = 263,            /* KEYWORD_MAIN  */
+    KEYWORD_IF = 264,              /* KEYWORD_IF  */
+    KEYWORD_ELSE = 265,            /* KEYWORD_ELSE  */
+    KEYWORD_FOR = 266,             /* KEYWORD_FOR  */
+    KEYWORD_WHILE = 267,           /* KEYWORD_WHILE  */
+    KEYWORD_SWITCH = 268,          /* KEYWORD_SWITCH  */
+    KEYWORD_CASE = 269,            /* KEYWORD_CASE  */
+    KEYWORD_DEFAULT = 270,         /* KEYWORD_DEFAULT  */
+    KEYWORD_BREAK = 271,           /* KEYWORD_BREAK  */
+    KEYWORD_CONTINUE = 272,        /* KEYWORD_CONTINUE  */
+    KEYWORD_RETURN = 273,          /* KEYWORD_RETURN  */
+    KEYWORD_PRINT = 274,           /* KEYWORD_PRINT  */
+    KEYWORD_SCAN = 275,            /* KEYWORD_SCAN  */
+    OP_EQ = 276,                   /* OP_EQ  */
+    OP_NE = 277,                   /* OP_NE  */
+    OP_LE = 278,                   /* OP_LE  */
+    OP_GE = 279,                   /* OP_GE  */
+    OP_LT = 280,                   /* OP_LT  */
+    OP_GT = 281,                   /* OP_GT  */
+    OP_PLUS = 282,                 /* OP_PLUS  */
+    OP_MINUS = 283,                /* OP_MINUS  */
+    OP_MUL = 284,                  /* OP_MUL  */
+    OP_DIV = 285,                  /* OP_DIV  */
+    OP_MOD = 286,                  /* OP_MOD  */
+    OP_INC = 287,                  /* OP_INC  */
+    OP_DEC = 288,                  /* OP_DEC  */
+    OP_AND = 289,                  /* OP_AND  */
+    OP_OR = 290,                   /* OP_OR  */
+    OP_NOT = 291,                  /* OP_NOT  */
+    OP_ASSIGN = 292,               /* OP_ASSIGN  */
+    OP_SIZE = 293,                 /* OP_SIZE  */
+    OP_SORT = 294,                 /* OP_SORT  */
+    OP_MATADD = 295,               /* OP_MATADD  */
+    OP_MATSUB = 296,               /* OP_MATSUB  */
+    OP_MATMUL = 297,               /* OP_MATMUL  */
+    OP_MATTRANSPOSE = 298,         /* OP_MATTRANSPOSE  */
+    OP_MATDET = 299,               /* OP_MATDET  */
+    OP_MATINV = 300,               /* OP_MATINV  */
+    OP_MATSHAPE = 301,             /* OP_MATSHAPE  */
+    DELIM_SEMI = 302,              /* DELIM_SEMI  */
+    DELIM_COMMA = 303,             /* DELIM_COMMA  */
+    DELIM_COLON = 304,             /* DELIM_COLON  */
+    DELIM_LPAREN = 305,            /* DELIM_LPAREN  */
+    DELIM_RPAREN = 306,            /* DELIM_RPAREN  */
+    DELIM_LBRACE = 307,            /* DELIM_LBRACE  */
+    DELIM_RBRACE = 308,            /* DELIM_RBRACE  */
+    DELIM_LBRACK = 309,            /* DELIM_LBRACK  */
+    DELIM_RBRACK = 310,            /* DELIM_RBRACK  */
+    ID = 311,                      /* ID  */
+    INT_CONST = 312,               /* INT_CONST  */
+    DECIMAL_CONST = 313,           /* DECIMAL_CONST  */
+    CHAR_CONST = 314,              /* CHAR_CONST  */
+    STRING = 315,                  /* STRING  */
+    UMINUS = 316                   /* UMINUS  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -129,7 +132,7 @@ union YYSTYPE
     ASTNode *node;
     char *str;
 
-#line 133 "parser.tab.h"
+#line 136 "parser.tab.h"
 
 };
 typedef union YYSTYPE YYSTYPE;
