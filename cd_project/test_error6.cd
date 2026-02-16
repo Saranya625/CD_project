@@ -1,4 +1,4 @@
 int main(){
-    /* This is multi 
-        line comment */
+    // This is multi 
+        line comment 
 }

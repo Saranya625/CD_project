@@ -80,8 +80,8 @@
 %type <node> postfix_expression
 %type <node> primary_expression
 %type <node> constant
-%type <str> type_specifier
 %type <node> delim_statement
+%type <str> type_specifier
 
 /* ---------- Operator Precedence ---------- */
 %right OP_ASSIGN
@@ -633,7 +633,6 @@ void printAST(ASTNode* node, int level)
     printAST(node->right, level + 1);
     printAST(node->third, level + 1);
 }
-
 
 void yyerror(const char *s) {
     fprintf(stderr, "Parse error at line %d: %s\n", line_no, s);

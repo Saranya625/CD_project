@@ -2365,7 +2365,6 @@ void printAST(ASTNode* node, int level)
     printAST(node->third, level + 1);
 }
 
-
 void yyerror(const char *s) {
     fprintf(stderr, "Parse error at line %d: %s\n", line_no, s);
 }
