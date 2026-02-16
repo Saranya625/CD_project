@@ -1,12 +1,12 @@
 int main() {
  c = "3";
-if (c== "3"){
+if (c == "3"){
 print("true");
 }
 else
 {
-print ("falllse");;;;;
+print ("falllse");
 c = c+3 ;
-}
-return;
+
+return ;
 }

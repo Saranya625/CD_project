@@ -1,6 +1,4 @@
 int main(){
-    a = "1234";
-    array a[10];
-    a[1] = 1;
-    print("Sum = ", a[10]);
+array a[10][10];
+return ;
 }
