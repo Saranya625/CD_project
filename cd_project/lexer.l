@@ -77,7 +77,7 @@ STRING      \"([^\"\\]|\\.)*\"
 {DECIMALC}  { print_token("DECIMAL_CONST", yytext); return DECIMAL_CONST; }
 {INTC}      { print_token("INT_CONST", yytext); return INT_CONST; }
 {CHARC}     { print_token("CHAR_CONST", yytext); return CHAR_CONST; }
-{STRING}    { print_token("STRING", yytext); return STRING; }
+{STRING}    { print_token("STRING_CONST", yytext); return STRING_CONST; }
 {ID}        { print_token("ID", yytext); return ID; }
 
 "//".*      { /* Single-line comment - ignore */ }
@@ -94,7 +94,7 @@ STRING      \"([^\"\\]|\\.)*\"
 
 [ \t\r]+      { /* Ignore whitespace */ }
 \n          { line_no++; }
-.           { printf("Lexical Error at line %d: %s\n", line_no, yytext); }
+.           { printf("Lexical Error at line %d: %s\n", line_no, yytext); exit(1); }
 %%
 
 int yywrap() { 

@@ -17,7 +17,7 @@
 
 
 /* ---------- Token Definitions ---------- */
-%token KEYWORD_INT KEYWORD_DECIMAL KEYWORD_CHAR KEYWORD_MATRIX KEYWORD_ARR
+%token KEYWORD_INT KEYWORD_DECIMAL KEYWORD_CHAR KEYWORD_STRING KEYWORD_MATRIX KEYWORD_ARR
 %token KEYWORD_MAIN KEYWORD_IF KEYWORD_ELSE
 %token KEYWORD_FOR KEYWORD_WHILE
 %token KEYWORD_SWITCH KEYWORD_CASE KEYWORD_DEFAULT
@@ -35,7 +35,7 @@
 %token DELIM_LPAREN DELIM_RPAREN
 %token DELIM_LBRACE DELIM_RBRACE
 %token DELIM_LBRACK DELIM_RBRACK
-%token <str> ID INT_CONST DECIMAL_CONST CHAR_CONST STRING
+%token <str> ID INT_CONST DECIMAL_CONST CHAR_CONST STRING_CONST
 
 %union {
     ASTNode *node;
@@ -45,16 +45,29 @@
 %type <node> program
 %type <node> global_declarations
 %type <node> global_declaration
-%type <str> type_specifier
+%type <node> main_block
 %type <node> block
 %type <node> statements
 %type <node> statement
 %type <node> declaration
 %type <node> assignment
+%type <node> assignment_expr
 %type <node> if_statement
 %type <node> for_loop
 %type <node> while_loop
-%type <node> assignment_expr
+%type <node> switch_statement
+%type <node> case_list_opt
+%type <node> case_list
+%type <node> case_statement
+%type <node> default_case
+%type <node> break_statement
+%type <node> continue_statement
+%type <node> return_statement
+%type <node> print_statement
+%type <node> print_args
+%type <node> print_arg
+%type <node> scan_statement
+%type <node> lvalue
 %type <node> expression
 %type <node> logical_or_expression
 %type <node> logical_and_expression
@@ -66,7 +79,8 @@
 %type <node> postfix_expression
 %type <node> primary_expression
 %type <node> constant
-
+%type <str> type_specifier
+%type <node> delim_statement
 
 /* ---------- Operator Precedence ---------- */
 %right OP_ASSIGN
@@ -83,7 +97,7 @@
 %%
 
 program:
-    global_declarations KEYWORD_INT KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN block
+    global_declarations KEYWORD_INT KEYWORD_MAIN DELIM_LPAREN DELIM_RPAREN main_block
     { 
         $$ = createNode("program", NULL, $1, $6, NULL); 
         root = $$;  
@@ -142,6 +156,16 @@ type_specifier:
     KEYWORD_INT         { $$ = "int"; }
     | KEYWORD_DECIMAL   { $$ = "decimal"; }
     | KEYWORD_CHAR      { $$ = "char"; }
+    | KEYWORD_STRING    { $$ = "string"; }
+    ;
+
+main_block:
+    DELIM_LBRACE statements return_statement DELIM_RBRACE
+    { $$ = createNode("main_block", NULL, $2, $3, NULL); }
+
+    | DELIM_LBRACE return_statement DELIM_RBRACE
+    { $$ = createNode("main_block", NULL, NULL, $2, NULL); }
+    ;
     ;
 
 block:
@@ -155,12 +179,12 @@ block:
 statements:
     statement   { $$ = $1; }
 
-    | statements statement
+    | statements statement 
     { $$ = createNode("statements", NULL, $1, $2, NULL); }
     ;
 
 statement:
-    declaration
+    declaration 
     | assignment
     | if_statement
     | for_loop
@@ -168,10 +192,16 @@ statement:
     | switch_statement
     | break_statement
     | continue_statement
-    | return_statement
     | print_statement
     | scan_statement
+    | return_statement
+    | delim_statement
     | block
+    ;
+
+delim_statement:
+    DELIM_SEMI
+    { $$ = createNode("empty", NULL, NULL, NULL, NULL); }
     ;
 
 declaration:
@@ -206,14 +236,13 @@ declaration:
 
 assignment:
     ID OP_ASSIGN expression DELIM_SEMI 
-    {$$ = createNode("assign", $1, $3, NULL, NULL);}
+    { $$ = createNode("assign", $1, $3, NULL, NULL); }
 
     | ID DELIM_LBRACK expression DELIM_RBRACK OP_ASSIGN expression DELIM_SEMI
     {
         $$ = createNode("assign", NULL,
                 createNode("array_access", $1, $3, NULL, NULL), $6, NULL);
     }
-
 
     | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK OP_ASSIGN expression DELIM_SEMI
     {
@@ -250,58 +279,90 @@ while_loop:
     ;
 
 switch_statement:
-    KEYWORD_SWITCH DELIM_LPAREN expression DELIM_RPAREN DELIM_LBRACE case_list DELIM_RBRACE
-    | KEYWORD_SWITCH DELIM_LPAREN expression DELIM_RPAREN DELIM_LBRACE case_list default_case DELIM_RBRACE
+    KEYWORD_SWITCH DELIM_LPAREN expression DELIM_RPAREN DELIM_LBRACE case_list_opt DELIM_RBRACE
+    { $$ = createNode("switch", NULL, $3, $6, NULL); }
+    ;
+
+case_list_opt:
+    /* empty */
+    { $$ = NULL; }
+
+    | case_list
+    { $$ = $1; }
     ;
 
 case_list:
     case_statement
+    { $$ = $1; }
+
     | case_list case_statement
+    { $$ = createNode("cases", NULL, $1, $2, NULL); }
+
+    | case_list default_case
+    { $$ = createNode("cases", NULL, $1, $2, NULL); }
     ;
 
 case_statement:
     KEYWORD_CASE constant DELIM_COLON statements
+    { $$ = createNode("case", NULL, $2, $4, NULL); }
     ;
 
 default_case:
     KEYWORD_DEFAULT DELIM_COLON statements
+    { $$ = createNode("default", NULL, $3, NULL, NULL); }
     ;
+
 
 break_statement:
     KEYWORD_BREAK DELIM_SEMI
+    { $$ = createNode("break", NULL, NULL, NULL, NULL); }
     ;
 
 continue_statement:
     KEYWORD_CONTINUE DELIM_SEMI
+    { $$ = createNode("continue", NULL, NULL, NULL, NULL); }
     ;
 
 return_statement:
     KEYWORD_RETURN expression DELIM_SEMI
+    { $$ = createNode("return", NULL, $2, NULL, NULL); }
+
     | KEYWORD_RETURN DELIM_SEMI
+    { $$ = createNode("return", NULL, NULL, NULL, NULL); }
     ;
 
 print_statement:
     KEYWORD_PRINT DELIM_LPAREN print_args DELIM_RPAREN DELIM_SEMI
+    { $$ = createNode("print", NULL, $3, NULL, NULL); }
     ;
 
 print_args:
     print_arg
+    { $$ = $1; }
+
     | print_args DELIM_COMMA print_arg
+    { $$ = createNode("print_args", NULL, $1, $3, NULL); }
     ;
 
 print_arg:
     expression
-    | STRING
+    { $$ = $1; }
     ;
 
 scan_statement:
     KEYWORD_SCAN DELIM_LPAREN lvalue DELIM_RPAREN DELIM_SEMI
+    { $$ = createNode("scan", NULL, $3, NULL, NULL); }
     ;
 
 lvalue:
     ID
+    { $$ = createNode("id", $1, NULL, NULL, NULL); }
+
     | ID DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("array_access", $1, $3, NULL, NULL); }
+
     | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("matrix_access", $1, $3, $6, NULL); }
     ;
 
 assignment_expr:
@@ -327,6 +388,7 @@ assignment_expr:
 /* Divided the expression into sub expressions */
 expression:
     logical_or_expression
+    { $$ = $1; }
     ;
 
 logical_or_expression:
@@ -476,6 +538,9 @@ constant:
 
     | CHAR_CONST
     { $$ = createNode("char", $1, NULL, NULL, NULL); }
+
+    | STRING_CONST
+    { $$ = createNode("string", $1, NULL, NULL, NULL); }
     ;
 
 %%
