@@ -1,0 +1,4 @@
+int main() {
+matrix a[10];
+return 0;
+}

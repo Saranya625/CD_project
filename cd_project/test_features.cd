@@ -1,12 +1,7 @@
-
 int main() {
-    // Variable declarations
-    int x;
-    decimal pi;
-    char grade;
     
     // Array and matrix declarations
-    int numbers[5];
+    array numbers[5];
     matrix m[3][3];
     
     // Assignments

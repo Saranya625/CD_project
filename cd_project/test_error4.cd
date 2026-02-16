@@ -1,0 +1,4 @@
+int main(){
+array a[10][10];
+return ;
+}
