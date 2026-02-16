@@ -74,11 +74,11 @@ STRING      \"([^\"\\]|\\.)*\"
 "["         { print_token("DELIM_LBRACK", yytext); return DELIM_LBRACK; }
 "]"         { print_token("DELIM_RBRACK", yytext); return DELIM_RBRACK; }
 
-{DECIMALC}  { print_token("DECIMAL_CONST", yytext); return DECIMAL_CONST; }
-{INTC}      { print_token("INT_CONST", yytext); return INT_CONST; }
-{CHARC}     { print_token("CHAR_CONST", yytext); return CHAR_CONST; }
-{STRING}    { print_token("STRING_CONST", yytext); return STRING_CONST; }
-{ID}        { print_token("ID", yytext); return ID; }
+{ID}        { print_token("ID", yytext); yylval.str = strdup(yytext); return ID; }
+{STRING}    { print_token("STRING_CONST", yytext); yylval.str = strdup(yytext); return STRING_CONST; }
+{INTC}      { print_token("INT_CONST", yytext); yylval.str = strdup(yytext); return INT_CONST; }
+{DECIMALC}  { print_token("DECIMAL_CONST", yytext); yylval.str = strdup(yytext); return DECIMAL_CONST; }
+{CHARC}     { print_token("CHAR_CONST", yytext); yylval.str = strdup(yytext); return CHAR_CONST; }
 
 "//".*      { /* Single-line comment - ignore */ }
 "/*"        { /* Multi-line comment start */

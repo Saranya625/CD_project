@@ -363,23 +363,23 @@ struct yy_trans_info
 static const flex_int16_t yy_accept[166] =
     {   0,
         0,    0,   66,   64,   62,   63,   28,   64,   35,   64,
-       64,   49,   50,   33,   31,   47,   32,   64,   34,   56,
-       48,   46,   24,   36,   25,   59,   53,   54,   59,   59,
-       59,   59,   59,   59,   59,   59,   59,   59,   59,   59,
-       51,   64,   52,   62,   21,    0,   58,    0,   26,    0,
+       64,   49,   50,   33,   31,   47,   32,   64,   34,   57,
+       48,   46,   24,   36,   25,   55,   53,   54,   55,   55,
+       55,   55,   55,   55,   55,   55,   55,   55,   55,   55,
+       51,   64,   52,   62,   21,    0,   56,    0,   26,    0,
         0,   29,   30,   45,    0,    0,    0,    0,    0,   61,
-       60,    0,   56,   22,   20,   23,   59,   59,   59,   59,
-       59,   59,   59,   59,   59,    8,   59,   59,   59,   59,
-       59,   59,   59,   59,   27,   57,    0,    0,    0,    0,
-        0,    0,    0,    0,   60,   55,   59,   59,   59,   59,
+       60,    0,   57,   22,   20,   23,   55,   55,   55,   55,
+       55,   55,   55,   55,   55,    8,   55,   55,   55,   55,
+       55,   55,   55,   55,   27,   59,    0,    0,    0,    0,
+        0,    0,    0,    0,   60,   58,   55,   55,   55,   55,
 
-       59,   59,   59,   59,   10,    1,   59,   59,   59,   59,
-       59,   59,   59,   59,   39,   42,   43,   41,    0,    0,
-        0,   40,   59,   59,   13,    3,   59,   59,   59,    9,
-        7,   59,   59,   59,   19,   59,   59,   59,    0,   37,
-       38,    5,   15,   59,   59,   59,   59,   18,   59,   59,
-       59,   11,   44,   59,   59,   59,    6,   17,    4,   12,
-       59,    2,   14,   16,    0
+       55,   55,   55,   55,   10,    1,   55,   55,   55,   55,
+       55,   55,   55,   55,   39,   42,   43,   41,    0,    0,
+        0,   40,   55,   55,   13,    3,   55,   55,   55,    9,
+        7,   55,   55,   55,   19,   55,   55,   55,    0,   37,
+       38,    5,   15,   55,   55,   55,   55,   18,   55,   55,
+       55,   11,   44,   55,   55,   55,    6,   17,    4,   12,
+       55,    2,   14,   16,    0
     } ;
 
 static const YY_CHAR yy_ec[256] =
@@ -1103,29 +1103,29 @@ YY_RULE_SETUP
 case 55:
 YY_RULE_SETUP
 #line 77 "lexer.l"
-{ print_token("DECIMAL_CONST", yytext); return DECIMAL_CONST; }
+{ print_token("ID", yytext); yylval.str = strdup(yytext); return ID; }
 	YY_BREAK
 case 56:
+/* rule 56 can match eol */
 YY_RULE_SETUP
 #line 78 "lexer.l"
-{ print_token("INT_CONST", yytext); return INT_CONST; }
+{ print_token("STRING_CONST", yytext); yylval.str = strdup(yytext); return STRING_CONST; }
 	YY_BREAK
 case 57:
-/* rule 57 can match eol */
 YY_RULE_SETUP
 #line 79 "lexer.l"
-{ print_token("CHAR_CONST", yytext); return CHAR_CONST; }
+{ print_token("INT_CONST", yytext); yylval.str = strdup(yytext); return INT_CONST; }
 	YY_BREAK
 case 58:
-/* rule 58 can match eol */
 YY_RULE_SETUP
 #line 80 "lexer.l"
-{ print_token("STRING_CONST", yytext); return STRING_CONST; }
+{ print_token("DECIMAL_CONST", yytext); yylval.str = strdup(yytext); return DECIMAL_CONST; }
 	YY_BREAK
 case 59:
+/* rule 59 can match eol */
 YY_RULE_SETUP
 #line 81 "lexer.l"
-{ print_token("ID", yytext); return ID; }
+{ print_token("CHAR_CONST", yytext); yylval.str = strdup(yytext); return CHAR_CONST; }
 	YY_BREAK
 case 60:
 YY_RULE_SETUP
