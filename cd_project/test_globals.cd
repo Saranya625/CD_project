@@ -2,7 +2,7 @@ global_x = 100;
 global_pi = 3.14;
 array global_array[10];
 
-main() {
+int main() {
     
     // Use global variables
     local_y = global_x + 50;

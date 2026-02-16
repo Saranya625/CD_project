@@ -1,4 +1,4 @@
-main() {
+int main() {
     
     // Array and matrix declarations
     array numbers[5];

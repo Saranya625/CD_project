@@ -52,6 +52,7 @@
 %type <node> declaration
 %type <node> assignment
 %type <node> assignment_expr
+%type <node> inc_dec_expr
 %type <node> if_statement
 %type <node> for_loop
 %type <node> while_loop
@@ -186,6 +187,7 @@ statements:
 statement:
     declaration 
     | assignment
+    | inc_dec_expr
     | if_statement
     | for_loop
     | while_loop
@@ -345,8 +347,17 @@ print_args:
     ;
 
 print_arg:
-    expression
-    { $$ = $1; }
+    STRING_CONST
+    { $$ = createNode("string", $1, NULL, NULL, NULL); }
+
+    | ID
+    { $$ = createNode("id", $1, NULL, NULL, NULL); }
+
+    | ID DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("array_access", $1, $3, NULL, NULL); }
+
+    | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("matrix_access", $1, $3, $6, NULL); }
     ;
 
 scan_statement:
@@ -383,7 +394,51 @@ assignment_expr:
         $$ = createNode("assign", NULL,
                 createNode("matrix_access", $1, $3, $6, NULL), $9, NULL);
     }
+
+    | inc_dec_expr
+    { $$ = $1; }
     ;
+
+inc_dec_expr:
+    /* Pre-increment / pre-decrement */
+      OP_INC ID
+    { $$ = createNode("pre_inc", NULL, createNode("id", $2, NULL, NULL, NULL), NULL, NULL); }
+
+    | OP_DEC ID
+    { $$ = createNode("pre_dec", NULL, createNode("id", $2, NULL, NULL, NULL), NULL, NULL); }
+
+    | OP_INC ID DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("pre_inc", NULL, createNode("array_access", $2, $4, NULL, NULL), NULL, NULL); }
+
+    | OP_DEC ID DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("pre_dec", NULL, createNode("array_access", $2, $4, NULL, NULL), NULL, NULL); }
+
+    | OP_INC ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("pre_inc", NULL, createNode("matrix_access", $2, $4, $7, NULL), NULL, NULL); }
+
+    | OP_DEC ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK
+    { $$ = createNode("pre_dec", NULL, createNode("matrix_access", $2, $4, $7, NULL), NULL, NULL); }
+
+    /* Post-increment / post-decrement */
+    | ID OP_INC
+    { $$ = createNode("post_inc", NULL, createNode("id", $1, NULL, NULL, NULL), NULL, NULL); }
+
+    | ID OP_DEC
+    { $$ = createNode("post_dec", NULL, createNode("id", $1, NULL, NULL, NULL), NULL, NULL); }
+
+    | ID DELIM_LBRACK expression DELIM_RBRACK OP_INC
+    { $$ = createNode("post_inc", NULL, createNode("array_access", $1, $3, NULL, NULL), NULL, NULL); }
+
+    | ID DELIM_LBRACK expression DELIM_RBRACK OP_DEC
+    { $$ = createNode("post_dec", NULL, createNode("array_access", $1, $3, NULL, NULL), NULL, NULL); }
+
+    | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK OP_INC
+    { $$ = createNode("post_inc", NULL, createNode("matrix_access", $1, $3, $6, NULL), NULL, NULL); }
+
+    | ID DELIM_LBRACK expression DELIM_RBRACK DELIM_LBRACK expression DELIM_RBRACK OP_DEC
+    { $$ = createNode("post_dec", NULL, createNode("matrix_access", $1, $3, $6, NULL), NULL, NULL); }
+    ;
+
 
 /* Divided the expression into sub expressions */
 expression:
