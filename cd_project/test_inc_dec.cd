@@ -1,8 +1,0 @@
-int main(){
-    int a = 1;
-    int b = a++;
-
-    for(i = 0; i < 100; i++){
-        --b;
-    }
-}
