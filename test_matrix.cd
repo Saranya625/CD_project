@@ -1,0 +1,15 @@
+int main(){
+    matrix A[3][3];
+    matrix B[3][3];
+
+    array x[10];
+
+    C = A.add(B);
+    D = A.mul(C);
+    E = A.T;
+    F = A.inv;
+    
+    len = x.size;
+
+    return;
+}
