@@ -1,0 +1,38 @@
+int main() {
+
+   int i; 
+    int j;
+    int temp;
+    int n;
+    array a[10];
+
+    print("Enter number of elements:");
+    scan(n);
+    if (n < 0 || n > 10) {
+        print("Invalid size. Enter a value between 0 and 10.");
+        return 0;
+    }
+
+    print("Enter array elements:");
+    for (i = 0; i < n; i = i + 1) {
+        scan(a[i]);
+    }
+
+
+    for (i = 0; i < n - 1; i = i + 1) {
+        for (j = 0 ;j < n - i - 1; j = j + 1) {
+            if (a[j] > a[j + 1]) {
+                temp = a[j];
+                a[j] = a[j + 1];
+                a[j + 1] = temp;
+            }
+        }
+    }
+    
+    print("Sorted Array:");
+    for (i = 0; i < n; i = i + 1) {
+        print(a[i]);
+    }
+
+    return 0;
+}
