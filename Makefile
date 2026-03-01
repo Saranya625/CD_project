@@ -3,8 +3,8 @@ CFLAGS = -Wall
 
 all: compiler
 
-compiler: parser.tab.c lex.yy.c semantic.c semantic.h
-	$(CC) $(CFLAGS) -o compiler parser.tab.c lex.yy.c semantic.c -lfl
+compiler: parser.tab.c lex.yy.c semantic.c semantic.h ir.c ir.h
+	$(CC) $(CFLAGS) -o compiler parser.tab.c lex.yy.c semantic.c ir.c -lfl
 
 parser.tab.c parser.tab.h: parser.y
 	bison -d parser.y

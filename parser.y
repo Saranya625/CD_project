@@ -8,6 +8,7 @@
     #include <string.h>
     #include "ast.h"
     #include "semantic.h"
+    #include "ir.h"
 
     extern int line_no;
     extern int yylex();
@@ -650,6 +651,8 @@ int main() {
         semantic_ok = semantic_analysis(root);
         if (semantic_ok) {
             printf("Semantic analysis completed successfully.\n");
+            printf("IR Output:\n");
+            generate_ir(root, stdout);
         } else {
             printf("Semantic analysis failed with %d error(s).\n", semantic_error_count());
         }
