@@ -1,6 +1,6 @@
 int main() {
 
-    int i;
+   int i; 
     int j;
     int temp;
     int n;
@@ -8,6 +8,10 @@ int main() {
 
     print("Enter number of elements:");
     scan(n);
+    if (n < 0 || n > 10) {
+        print("Invalid size. Enter a value between 0 and 10.");
+        return 0;
+    }
 
     print("Enter array elements:");
     for (i = 0; i < n; i = i + 1) {
@@ -24,11 +28,11 @@ int main() {
             }
         }
     }
-
+    
     print("Sorted Array:");
     for (i = 0; i < n; i = i + 1) {
         print(a[i]);
     }
 
-    return;
+    return 0;
 }

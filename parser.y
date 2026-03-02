@@ -7,6 +7,8 @@
     #include <stdlib.h>
     #include <string.h>
     #include "ast.h"
+    #include "semantic.h"
+    #include "ir.h"
 
     extern int line_no;
     extern int yylex();
@@ -120,7 +122,6 @@ global_declarations:
     { $$ = createNode("global", NULL, $1, $2, NULL); }
     ;
 
-/*Only allowing matrix and array keywords for declaration*/
 global_declaration:
     type_specifier ID DELIM_SEMI
     {
@@ -149,9 +150,9 @@ global_declaration:
                 createNode("size", $4, NULL, NULL, NULL), NULL, NULL);
     }
 
-    | ID OP_ASSIGN expression DELIM_SEMI
-    { $$ = createNode("assign", $1, $3, NULL, NULL); }
-    ;
+    /*| ID OP_ASSIGN expression DELIM_SEMI*/
+    /*{ $$ = createNode("assign", $1, $3, NULL, NULL); }*/
+    /*;*/
 
 type_specifier:
     KEYWORD_INT         { $$ = "int"; }
@@ -639,13 +640,32 @@ void yyerror(const char *s) {
 }
 
 int main() {
+    int parse_ok;
+    int semantic_ok = 0;
 
-   printf("Tokens Generated:\n");
-    if (yyparse() == 0) {
+    printf("Tokens Generated:\n");
+    parse_ok = (yyparse() == 0);
+    if (parse_ok) {
         printf("Parsing completed successfully.\n");
+        printAST(root, 0);
+        semantic_ok = semantic_analysis(root);
+        if (semantic_ok) {
+            printf("Semantic analysis completed successfully.\n");
+            printf("IR Output:\n");
+            FILE *ir_out = fopen("output.ir", "w");
+            if (!ir_out) {
+                perror("fopen output.ir");
+                return 1; /* or YYABORT / appropriate error path */
+            }
+
+            generate_ir(root, ir_out);
+            generate_ir(root, stdout);
+            fclose(ir_out);
+        } else {
+            printf("Semantic analysis failed with %d error(s).\n", semantic_error_count());
+        }
     } else {
         printf("Parsing failed.\n");
     }
-    printAST(root, 0);
     return 0;
 }

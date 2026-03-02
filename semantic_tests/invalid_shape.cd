@@ -1,0 +1,9 @@
+int main() {
+    matrix a[2][3];
+    matrix b[4][2];
+    matrix c[2][3];
+
+    c = a.mul(b);
+
+    return 0;
+}

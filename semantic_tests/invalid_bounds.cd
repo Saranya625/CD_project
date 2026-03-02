@@ -1,0 +1,9 @@
+int main() {
+    array a[5];
+    matrix m[2][2];
+
+    a[5] = 1;
+    m[2][0] = 3;
+
+    return 0;
+}

@@ -1,0 +1,11 @@
+int main(){
+ int a = 5 ;
+int b =  3 ;
+int c ; 
+int k = 'x';
+c = 'a'+b ; 
+int e ; 
+e = a-b ; 
+array f[2];
+return 0 ;
+}
