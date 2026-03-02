@@ -1,0 +1,29 @@
+IR_BEGIN
+decl int a
+t1 = addr a
+t2 = const int 5
+store [t1], t2
+decl int b
+t3 = addr b
+t4 = const int 3
+store [t3], t4
+decl int c
+decl int k
+t5 = addr k
+t6 = const char 'x'
+store [t5], t6
+t7 = addr c
+t8 = const char 'a'
+t9 = load b
+t10 = + t8, t9
+store [t7], t10
+decl int e
+t11 = addr e
+t12 = load a
+t13 = load b
+t14 = - t12, t13
+store [t11], t14
+decl_array f, 2
+t15 = const int 0
+ret t15
+IR_END
