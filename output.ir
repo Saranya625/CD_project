@@ -1,29 +1,212 @@
 IR_BEGIN
-decl int a
-t1 = addr a
-t2 = const int 5
-store [t1], t2
-decl int b
-t3 = addr b
-t4 = const int 3
-store [t3], t4
-decl int c
-decl int k
-t5 = addr k
-t6 = const char 'x'
+decl_matrix a, 3, 3
+decl_matrix b, 3, 3
+decl_array c, 10
+decl_array d, 5
+decl decimal e
+decl_matrix mat_tmpA1, 3, 3
+decl int mat_r2
+decl int mat_c3
+t4 = addr mat_r2
+t5 = addr mat_c3
+t6 = const int 0
+t7 = const int 1
+t8 = const int 3
+t9 = const int 3
+store [t4], t6
+label L1
+t10 = load mat_r2
+t11 = lt t10, t8
+ifz t11 goto L2
 store [t5], t6
-t7 = addr c
-t8 = const char 'a'
-t9 = load b
-t10 = + t8, t9
-store [t7], t10
-decl int e
-t11 = addr e
-t12 = load a
-t13 = load b
-t14 = - t12, t13
-store [t11], t14
-decl_array f, 2
-t15 = const int 0
-ret t15
+label L3
+t12 = load mat_c3
+t13 = lt t12, t9
+ifz t13 goto L4
+t14 = load mat_r2
+t15 = load mat_c3
+t16 = addr a
+t17 = mul t14, cols(a)
+t18 = add t17, t15
+t19 = mul t18, 4
+t20 = add t16, t19
+t21 = addr mat_tmpA1
+t22 = mul t14, cols(mat_tmpA1)
+t23 = add t22, t15
+t24 = mul t23, 4
+t25 = add t21, t24
+t26 = load [t20]
+store [t25], t26
+t27 = load mat_c3
+t28 = + t27, t7
+store [t5], t28
+goto L3
+label L4
+t29 = load mat_r2
+t30 = + t29, t7
+store [t4], t30
+goto L1
+label L2
+decl int mat_i31
+decl int mat_j32
+decl int mat_r33
+t34 = addr mat_i31
+t35 = addr mat_j32
+t36 = addr mat_r33
+t37 = const int 0
+t38 = const int 1
+t39 = const int 3
+store [t34], t37
+label L5
+t40 = load mat_i31
+t41 = lt t40, t39
+ifz t41 goto L6
+store [t35], t37
+label L7
+t42 = load mat_j32
+t43 = lt t42, t39
+ifz t43 goto L8
+t44 = load mat_i31
+t45 = load mat_j32
+t46 = eq t44, t45
+ifz t46 goto L9
+t47 = addr b
+t48 = mul t44, cols(b)
+t49 = add t48, t45
+t50 = mul t49, 4
+t51 = add t47, t50
+store [t51], t38
+goto L10
+label L9
+t52 = addr b
+t53 = mul t44, cols(b)
+t54 = add t53, t45
+t55 = mul t54, 4
+t56 = add t52, t55
+store [t56], t37
+label L10
+t57 = load mat_j32
+t58 = + t57, t38
+store [t35], t58
+goto L7
+label L8
+t59 = load mat_i31
+t60 = + t59, t38
+store [t34], t60
+goto L5
+label L6
+store [t34], t37
+label L11
+t61 = load mat_i31
+t62 = lt t61, t39
+ifz t62 goto L12
+t63 = load mat_i31
+t64 = addr mat_tmpA1
+t65 = mul t63, cols(mat_tmpA1)
+t66 = add t65, t63
+t67 = mul t66, 4
+t68 = add t64, t67
+t69 = load [t68]
+store [t35], t37
+label L13
+t70 = load mat_j32
+t71 = lt t70, t39
+ifz t71 goto L14
+t72 = load mat_j32
+t73 = addr mat_tmpA1
+t74 = mul t63, cols(mat_tmpA1)
+t75 = add t74, t72
+t76 = mul t75, 4
+t77 = add t73, t76
+t78 = addr b
+t79 = mul t63, cols(b)
+t80 = add t79, t72
+t81 = mul t80, 4
+t82 = add t78, t81
+t83 = load [t77]
+t84 = load [t82]
+t85 = / t83, t69
+t86 = / t84, t69
+store [t77], t85
+store [t82], t86
+t87 = load mat_j32
+t88 = + t87, t38
+store [t35], t88
+goto L13
+label L14
+store [t36], t37
+label L15
+t89 = load mat_r33
+t90 = lt t89, t39
+ifz t90 goto L16
+t91 = load mat_i31
+t92 = load mat_r33
+t93 = eq t92, t91
+ifz t93 goto L17
+t94 = + t92, t38
+store [t36], t94
+goto L15
+label L17
+t95 = load mat_i31
+t96 = load mat_r33
+t97 = addr mat_tmpA1
+t98 = mul t96, cols(mat_tmpA1)
+t99 = add t98, t95
+t100 = mul t99, 4
+t101 = add t97, t100
+t102 = load [t101]
+store [t35], t37
+label L18
+t103 = load mat_j32
+t104 = lt t103, t39
+ifz t104 goto L19
+t105 = load mat_j32
+t106 = addr mat_tmpA1
+t107 = mul t96, cols(mat_tmpA1)
+t108 = add t107, t105
+t109 = mul t108, 4
+t110 = add t106, t109
+t111 = addr mat_tmpA1
+t112 = mul t95, cols(mat_tmpA1)
+t113 = add t112, t105
+t114 = mul t113, 4
+t115 = add t111, t114
+t116 = addr b
+t117 = mul t96, cols(b)
+t118 = add t117, t105
+t119 = mul t118, 4
+t120 = add t116, t119
+t121 = addr b
+t122 = mul t95, cols(b)
+t123 = add t122, t105
+t124 = mul t123, 4
+t125 = add t121, t124
+t126 = load [t110]
+t127 = load [t115]
+t128 = load [t120]
+t129 = load [t125]
+t130 = * t102, t127
+t131 = * t102, t129
+t132 = - t126, t130
+t133 = - t128, t131
+store [t110], t132
+store [t120], t133
+t134 = load mat_j32
+t135 = + t134, t38
+store [t35], t135
+goto L18
+label L19
+t136 = load mat_r33
+t137 = + t136, t38
+store [t36], t137
+goto L15
+label L16
+t138 = load mat_i31
+t139 = + t138, t38
+store [t34], t139
+goto L11
+label L12
+t140 = addr e
+t141 = const int 10
+store [t140], t141
 IR_END

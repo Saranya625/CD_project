@@ -1,0 +1,1 @@
+- Doesnt work properly for A = A.T
