@@ -1,9 +1,8 @@
 int main(){
     matrix a[3][3];
     matrix b[3][3];
-    array c[10];
+    matrix c[3][3];
     array d[5];
     decimal e;
-    b = a.inv;
-    e = c.size;
+    e = d.size;
 }
