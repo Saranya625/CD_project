@@ -1,0 +1,13 @@
+int main() {
+    int a;
+    int b;
+    int x;
+
+    a = 4;
+    b = 9;
+
+    x = b * 2;      // should become b + b
+
+    print("x = ", x);
+    return 0;
+}

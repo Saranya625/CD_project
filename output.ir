@@ -1,10 +1,19 @@
 IR_BEGIN
-decl_matrix a, 3, 3
-decl_matrix b, 3, 3
-decl_matrix c, 3, 3
-decl_array d, 5
-decl decimal e
-t1 = addr e
-t2 = const int 5
+decl int a
+decl int b
+decl int x
+t1 = addr a
+t2 = const int 4
 store [t1], t2
+t3 = addr b
+t4 = const int 9
+store [t3], t4
+t5 = addr x
+t6 = const int 18
+store [t5], t6
+print_str "x = "
+t7 = const int 18
+print t7
+t8 = const int 0
+ret t8
 IR_END

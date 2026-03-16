@@ -1,0 +1,7 @@
+int main(){
+    array a[5];
+    int n;
+    n = a.size + 2;
+    print("n=", n);
+    return 0;
+}

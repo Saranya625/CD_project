@@ -1,1 +1,2 @@
 - Doesnt work properly for A = A.T
+- Dead Code Elimination

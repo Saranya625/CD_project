@@ -1,0 +1,8 @@
+int main(){
+    int v = 3;
+    v++;
+    ++v;
+    v = v + 2;
+    print("v=", v);
+    return 0;
+}

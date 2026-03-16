@@ -1,0 +1,14 @@
+int main() {
+    int a;
+    int b;
+    int x;
+    int y;
+
+    x = (a + b);
+    y = (b+a);
+
+    print("x = ", x);
+
+    a = (b+a);
+    return 0;
+}

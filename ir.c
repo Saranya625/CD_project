@@ -10,6 +10,8 @@ typedef struct {
     int indent;
     struct MatrixInfo *matrices;
     struct ArrayInfo *arrays;
+    struct ConstBinding *consts;
+    struct ExprCache *cse_cache;
 } IRContext;
 
 typedef struct MatrixInfo {
@@ -24,6 +26,33 @@ typedef struct ArrayInfo {
     int size;
     struct ArrayInfo *next;
 } ArrayInfo;
+
+typedef enum {
+    CONST_NONE = 0,
+    CONST_INT,
+    CONST_DECIMAL,
+    CONST_CHAR,
+    CONST_STRING
+} ConstKind;
+
+typedef struct ConstVal {
+    ConstKind kind;
+    long long i;
+    double d;
+    const char *s;
+} ConstVal;
+
+typedef struct ConstBinding {
+    char *name;
+    ConstVal val;
+    struct ConstBinding *next;
+} ConstBinding;
+
+typedef struct ExprCache {
+    char *key;
+    int temp;
+    struct ExprCache *next;
+} ExprCache;
 
 static void ir_printf(IRContext *ctx, FILE *out, const char *fmt, ...)
 {
@@ -74,6 +103,493 @@ static int parse_int_value(const char *text, int *out)
 
     *out = (int) value;
     return 1;
+}
+
+static int parse_double_value(const char *text, double *out)
+{
+    char *end = NULL;
+    double value;
+
+    if (!text || !out) {
+        return 0;
+    }
+
+    value = strtod(text, &end);
+    if (end == text || *end != '\0') {
+        return 0;
+    }
+
+    *out = value;
+    return 1;
+}
+
+static int parse_char_value(const char *text, int *out)
+{
+    size_t len;
+
+    if (!text || !out) {
+        return 0;
+    }
+
+    len = strlen(text);
+    if (len < 3 || text[0] != '\'' || text[len - 1] != '\'') {
+        return 0;
+    }
+
+    if (text[1] != '\\') {
+        *out = (unsigned char) text[1];
+        return 1;
+    }
+
+    if (len < 4) {
+        return 0;
+    }
+
+    switch (text[2]) {
+        case 'n':
+            *out = '\n';
+            return 1;
+        case 't':
+            *out = '\t';
+            return 1;
+        case 'r':
+            *out = '\r';
+            return 1;
+        case '0':
+            *out = '\0';
+            return 1;
+        case '\\':
+            *out = '\\';
+            return 1;
+        case '\'':
+            *out = '\'';
+            return 1;
+        case 'b':
+            *out = '\b';
+            return 1;
+        case 'f':
+            *out = '\f';
+            return 1;
+        case 'v':
+            *out = '\v';
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void const_free_list(ConstBinding *head)
+{
+    while (head) {
+        ConstBinding *next = head->next;
+        free(head->name);
+        free(head);
+        head = next;
+    }
+}
+
+static void const_clear(IRContext *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    const_free_list(ctx->consts);
+    ctx->consts = NULL;
+}
+
+static ConstBinding *const_find_binding(IRContext *ctx, const char *name)
+{
+    ConstBinding *cur;
+
+    if (!ctx || !name) {
+        return NULL;
+    }
+
+    cur = ctx->consts;
+    while (cur) {
+        if (strcmp(cur->name, name) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+static void const_unbind(IRContext *ctx, const char *name)
+{
+    ConstBinding *cur;
+    ConstBinding *prev;
+
+    if (!ctx || !name) {
+        return;
+    }
+
+    prev = NULL;
+    cur = ctx->consts;
+    while (cur) {
+        if (strcmp(cur->name, name) == 0) {
+            if (prev) {
+                prev->next = cur->next;
+            } else {
+                ctx->consts = cur->next;
+            }
+            free(cur->name);
+            free(cur);
+            return;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+}
+
+static void const_bind(IRContext *ctx, const char *name, const ConstVal *val)
+{
+    ConstBinding *cur;
+
+    if (!ctx || !name || !val) {
+        return;
+    }
+
+    cur = const_find_binding(ctx, name);
+    if (!cur) {
+        cur = malloc(sizeof(ConstBinding));
+        cur->name = strdup(name);
+        cur->next = ctx->consts;
+        ctx->consts = cur;
+    }
+    cur->val = *val;
+}
+
+static void expr_cache_free(ExprCache *head)
+{
+    while (head) {
+        ExprCache *next = head->next;
+        free(head->key);
+        free(head);
+        head = next;
+    }
+}
+
+static ExprCache *expr_cache_find(ExprCache *head, const char *key)
+{
+    while (head) {
+        if (strcmp(head->key, key) == 0) {
+            return head;
+        }
+        head = head->next;
+    }
+    return NULL;
+}
+
+static void expr_cache_add(ExprCache **head, char *key, int temp)
+{
+    ExprCache *node;
+
+    if (!head || !key) {
+        return;
+    }
+    node = malloc(sizeof(ExprCache));
+    node->key = key;
+    node->temp = temp;
+    node->next = *head;
+    *head = node;
+}
+
+static void cse_clear(IRContext *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    expr_cache_free(ctx->cse_cache);
+    ctx->cse_cache = NULL;
+}
+
+static int cse_key_mentions(const char *key, const char *name)
+{
+    char buf[128];
+
+    if (!key || !name || name[0] == '\0') {
+        return 0;
+    }
+    snprintf(buf, sizeof(buf), "id:%s", name);
+    if (strstr(key, buf)) {
+        return 1;
+    }
+    snprintf(buf, sizeof(buf), "arr:%s[", name);
+    if (strstr(key, buf)) {
+        return 1;
+    }
+    snprintf(buf, sizeof(buf), "mat:%s[", name);
+    if (strstr(key, buf)) {
+        return 1;
+    }
+    return 0;
+}
+
+static void cse_invalidate_name(IRContext *ctx, const char *name)
+{
+    ExprCache *cur;
+    ExprCache *prev;
+
+    if (!ctx || !name) {
+        return;
+    }
+    prev = NULL;
+    cur = ctx->cse_cache;
+    while (cur) {
+        ExprCache *next = cur->next;
+        if (cse_key_mentions(cur->key, name)) {
+            if (prev) {
+                prev->next = next;
+            } else {
+                ctx->cse_cache = next;
+            }
+            free(cur->key);
+            free(cur);
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
+}
+
+static ConstBinding *const_clone_list(const ConstBinding *head)
+{
+    ConstBinding *result = NULL;
+    ConstBinding *tail = NULL;
+
+    while (head) {
+        ConstBinding *node = malloc(sizeof(ConstBinding));
+        node->name = strdup(head->name);
+        node->val = head->val;
+        node->next = NULL;
+        if (!result) {
+            result = node;
+        } else {
+            tail->next = node;
+        }
+        tail = node;
+        head = head->next;
+    }
+    return result;
+}
+
+static int const_val_equal(const ConstVal *a, const ConstVal *b)
+{
+    if (!a || !b) {
+        return 0;
+    }
+    if (a->kind != b->kind) {
+        return 0;
+    }
+    switch (a->kind) {
+        case CONST_INT:
+            return a->i == b->i;
+        case CONST_DECIMAL:
+            return a->d == b->d;
+        case CONST_CHAR:
+        case CONST_STRING:
+            return a->s && b->s && strcmp(a->s, b->s) == 0;
+        default:
+            return 0;
+    }
+}
+
+static int expr_is_pure(ASTNode *node)
+{
+    if (!node || !node->type) {
+        return 0;
+    }
+    if (strcmp(node->type, "int") == 0 ||
+        strcmp(node->type, "decimal") == 0 ||
+        strcmp(node->type, "char") == 0 ||
+        strcmp(node->type, "string") == 0 ||
+        strcmp(node->type, "id") == 0) {
+        return 1;
+    }
+    if (strcmp(node->type, "array_access") == 0) {
+        return expr_is_pure(node->left);
+    }
+    if (strcmp(node->type, "matrix_access") == 0) {
+        return expr_is_pure(node->left) && expr_is_pure(node->right);
+    }
+    if (strcmp(node->type, "not") == 0 || strcmp(node->type, "uminus") == 0) {
+        return expr_is_pure(node->left);
+    }
+    if (strcmp(node->type, "+") == 0 || strcmp(node->type, "-") == 0 ||
+        strcmp(node->type, "*") == 0 || strcmp(node->type, "/") == 0 ||
+        strcmp(node->type, "%") == 0 ||
+        strcmp(node->type, "eq") == 0 || strcmp(node->type, "ne") == 0 ||
+        strcmp(node->type, "lt") == 0 || strcmp(node->type, "gt") == 0 ||
+        strcmp(node->type, "le") == 0 || strcmp(node->type, "ge") == 0 ||
+        strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0 ||
+        strcmp(node->type, "matadd") == 0 || strcmp(node->type, "matsub") == 0 ||
+        strcmp(node->type, "matmul") == 0) {
+        return expr_is_pure(node->left) && expr_is_pure(node->right);
+    }
+    if (strcmp(node->type, "size") == 0 ||
+        strcmp(node->type, "sort") == 0 ||
+        strcmp(node->type, "transpose") == 0 ||
+        strcmp(node->type, "det") == 0 ||
+        strcmp(node->type, "inv") == 0 ||
+        strcmp(node->type, "shape") == 0) {
+        return expr_is_pure(node->left);
+    }
+    if (strcmp(node->type, "pre_inc") == 0 || strcmp(node->type, "pre_dec") == 0 ||
+        strcmp(node->type, "post_inc") == 0 || strcmp(node->type, "post_dec") == 0) {
+        return 0;
+    }
+    if (strcmp(node->type, "assign") == 0) {
+        return 0;
+    }
+    return 0;
+}
+
+static char *str_printf(const char *fmt, ...)
+{
+    va_list args;
+    va_list copy;
+    int len;
+    char *buf;
+
+    va_start(args, fmt);
+    va_copy(copy, args);
+    len = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (len < 0) {
+        va_end(copy);
+        return NULL;
+    }
+    buf = malloc((size_t) len + 1);
+    if (!buf) {
+        va_end(copy);
+        return NULL;
+    }
+    vsnprintf(buf, (size_t) len + 1, fmt, copy);
+    va_end(copy);
+    return buf;
+}
+
+static char *expr_key(ASTNode *node)
+{
+    char *left = NULL;
+    char *right = NULL;
+    char *key = NULL;
+
+    if (!expr_is_pure(node)) {
+        return NULL;
+    }
+    if (strcmp(node->type, "int") == 0 ||
+        strcmp(node->type, "decimal") == 0 ||
+        strcmp(node->type, "char") == 0 ||
+        strcmp(node->type, "string") == 0 ||
+        strcmp(node->type, "id") == 0) {
+        return str_printf("%s:%s", node->type, safe_str(node->value));
+    }
+    if (strcmp(node->type, "array_access") == 0) {
+        left = expr_key(node->left);
+        if (!left) {
+            return NULL;
+        }
+        key = str_printf("arr:%s[%s]", safe_str(node->value), left);
+        free(left);
+        return key;
+    }
+    if (strcmp(node->type, "matrix_access") == 0) {
+        left = expr_key(node->left);
+        right = expr_key(node->right);
+        if (!left || !right) {
+            free(left);
+            free(right);
+            return NULL;
+        }
+        key = str_printf("mat:%s[%s,%s]", safe_str(node->value), left, right);
+        free(left);
+        free(right);
+        return key;
+    }
+    if (strcmp(node->type, "not") == 0 || strcmp(node->type, "uminus") == 0) {
+        left = expr_key(node->left);
+        if (!left) {
+            return NULL;
+        }
+        key = str_printf("%s(%s)", node->type, left);
+        free(left);
+        return key;
+    }
+    if (strcmp(node->type, "+") == 0 || strcmp(node->type, "-") == 0 ||
+        strcmp(node->type, "*") == 0 || strcmp(node->type, "/") == 0 ||
+        strcmp(node->type, "%") == 0 ||
+        strcmp(node->type, "eq") == 0 || strcmp(node->type, "ne") == 0 ||
+        strcmp(node->type, "lt") == 0 || strcmp(node->type, "gt") == 0 ||
+        strcmp(node->type, "le") == 0 || strcmp(node->type, "ge") == 0 ||
+        strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0 ||
+        strcmp(node->type, "matadd") == 0 || strcmp(node->type, "matsub") == 0 ||
+        strcmp(node->type, "matmul") == 0) {
+        left = expr_key(node->left);
+        right = expr_key(node->right);
+        if (!left || !right) {
+            free(left);
+            free(right);
+            return NULL;
+        }
+        key = str_printf("%s(%s,%s)", node->type, left, right);
+        free(left);
+        free(right);
+        return key;
+    }
+    if (strcmp(node->type, "size") == 0 ||
+        strcmp(node->type, "sort") == 0 ||
+        strcmp(node->type, "transpose") == 0 ||
+        strcmp(node->type, "det") == 0 ||
+        strcmp(node->type, "inv") == 0 ||
+        strcmp(node->type, "shape") == 0) {
+        left = expr_key(node->left);
+        if (!left) {
+            return NULL;
+        }
+        key = str_printf("%s(%s)", node->type, left);
+        free(left);
+        return key;
+    }
+    return NULL;
+}
+
+static ConstBinding *const_intersect(ConstBinding *a, ConstBinding *b)
+{
+    ConstBinding *result = NULL;
+    ConstBinding *tail = NULL;
+
+    while (a) {
+        ConstBinding *cur = b;
+        while (cur) {
+            if (strcmp(a->name, cur->name) == 0 && const_val_equal(&a->val, &cur->val)) {
+                ConstBinding *node = malloc(sizeof(ConstBinding));
+                node->name = strdup(a->name);
+                node->val = a->val;
+                node->next = NULL;
+                if (!result) {
+                    result = node;
+                } else {
+                    tail->next = node;
+                }
+                tail = node;
+                break;
+            }
+            cur = cur->next;
+        }
+        a = a->next;
+    }
+    return result;
+}
+
+static void const_set(IRContext *ctx, ConstBinding *list)
+{
+    if (!ctx) {
+        return;
+    }
+    const_free_list(ctx->consts);
+    ctx->consts = list;
 }
 
 static void add_matrix_info(IRContext *ctx, const char *name, int rows, int cols)
@@ -141,6 +657,398 @@ static ArrayInfo *find_array_info(IRContext *ctx, const char *name)
         info = info->next;
     }
     return NULL;
+}
+
+static int const_is_numeric(const ConstVal *val)
+{
+    if (!val) {
+        return 0;
+    }
+    return val->kind == CONST_INT || val->kind == CONST_DECIMAL || val->kind == CONST_CHAR;
+}
+
+static int const_to_int(const ConstVal *val, long long *out)
+{
+    int ch = 0;
+
+    if (!val || !out) {
+        return 0;
+    }
+    if (val->kind == CONST_INT) {
+        *out = val->i;
+        return 1;
+    }
+    if (val->kind == CONST_CHAR) {
+        if (!parse_char_value(val->s, &ch)) {
+            return 0;
+        }
+        *out = ch;
+        return 1;
+    }
+    return 0;
+}
+
+static int const_to_double(const ConstVal *val, double *out)
+{
+    int ch = 0;
+
+    if (!val || !out) {
+        return 0;
+    }
+    if (val->kind == CONST_DECIMAL) {
+        *out = val->d;
+        return 1;
+    }
+    if (val->kind == CONST_INT) {
+        *out = (double) val->i;
+        return 1;
+    }
+    if (val->kind == CONST_CHAR) {
+        if (!parse_char_value(val->s, &ch)) {
+            return 0;
+        }
+        *out = (double) ch;
+        return 1;
+    }
+    return 0;
+}
+
+static int const_to_bool(const ConstVal *val, int *out)
+{
+    long long i = 0;
+    double d = 0.0;
+
+    if (!val || !out) {
+        return 0;
+    }
+    if (!const_is_numeric(val)) {
+        return 0;
+    }
+    if (val->kind == CONST_DECIMAL) {
+        if (!const_to_double(val, &d)) {
+            return 0;
+        }
+        *out = (d != 0.0);
+        return 1;
+    }
+    if (!const_to_int(val, &i)) {
+        return 0;
+    }
+    *out = (i != 0);
+    return 1;
+}
+
+static int const_is_zero(const ConstVal *val)
+{
+    long long i = 0;
+    double d = 0.0;
+
+    if (!val) {
+        return 0;
+    }
+    if (val->kind == CONST_DECIMAL) {
+        return const_to_double(val, &d) && d == 0.0;
+    }
+    return const_to_int(val, &i) && i == 0;
+}
+
+static int const_is_one(const ConstVal *val)
+{
+    long long i = 0;
+    double d = 0.0;
+
+    if (!val) {
+        return 0;
+    }
+    if (val->kind == CONST_DECIMAL) {
+        return const_to_double(val, &d) && d == 1.0;
+    }
+    return const_to_int(val, &i) && i == 1;
+}
+
+static int const_is_neg_one(const ConstVal *val)
+{
+    long long i = 0;
+    double d = 0.0;
+
+    if (!val) {
+        return 0;
+    }
+    if (val->kind == CONST_DECIMAL) {
+        return const_to_double(val, &d) && d == -1.0;
+    }
+    return const_to_int(val, &i) && i == -1;
+}
+
+static int const_compare_equal(const ConstVal *a, const ConstVal *b)
+{
+    long long ai = 0;
+    long long bi = 0;
+    double ad = 0.0;
+    double bd = 0.0;
+
+    if (!a || !b) {
+        return 0;
+    }
+    if (!const_is_numeric(a) || !const_is_numeric(b)) {
+        return 0;
+    }
+    if (a->kind == CONST_DECIMAL || b->kind == CONST_DECIMAL) {
+        if (!const_to_double(a, &ad) || !const_to_double(b, &bd)) {
+            return 0;
+        }
+        return ad == bd;
+    }
+    if (!const_to_int(a, &ai) || !const_to_int(b, &bi)) {
+        return 0;
+    }
+    return ai == bi;
+}
+
+static int emit_const_value(IRContext *ctx, const ConstVal *val, FILE *out)
+{
+    char buf[64];
+
+    if (!ctx || !val) {
+        return -1;
+    }
+
+    switch (val->kind) {
+        case CONST_INT:
+            snprintf(buf, sizeof(buf), "%lld", val->i);
+            return emit_const(ctx, "int", buf, out);
+        case CONST_DECIMAL:
+            snprintf(buf, sizeof(buf), "%.15g", val->d);
+            return emit_const(ctx, "decimal", buf, out);
+        case CONST_CHAR:
+            return emit_const(ctx, "char", val->s, out);
+        case CONST_STRING:
+            return emit_const(ctx, "string", val->s, out);
+        default:
+            return -1;
+    }
+}
+
+static int eval_const_expr(IRContext *ctx, ASTNode *node, ConstVal *out)
+{
+    ConstBinding *binding;
+    ConstVal lhs;
+    ConstVal rhs;
+    long long li = 0;
+    long long ri = 0;
+    double ld = 0.0;
+    double rd = 0.0;
+    int tmp = 0;
+
+    if (!node || !out || !node->type) {
+        return 0;
+    }
+
+    if (strcmp(node->type, "int") == 0) {
+        if (!parse_int_value(node->value, &tmp)) {
+            return 0;
+        }
+        out->kind = CONST_INT;
+        out->i = tmp;
+        out->d = 0.0;
+        out->s = NULL;
+        return 1;
+    }
+    if (strcmp(node->type, "decimal") == 0) {
+        if (!parse_double_value(node->value, &ld)) {
+            return 0;
+        }
+        out->kind = CONST_DECIMAL;
+        out->d = ld;
+        out->i = 0;
+        out->s = NULL;
+        return 1;
+    }
+    if (strcmp(node->type, "char") == 0) {
+        if (!parse_char_value(node->value, &tmp)) {
+            return 0;
+        }
+        out->kind = CONST_CHAR;
+        out->i = tmp;
+        out->d = 0.0;
+        out->s = node->value;
+        return 1;
+    }
+    if (strcmp(node->type, "string") == 0) {
+        out->kind = CONST_STRING;
+        out->s = node->value;
+        out->i = 0;
+        out->d = 0.0;
+        return 1;
+    }
+    if (strcmp(node->type, "id") == 0) {
+        binding = const_find_binding(ctx, node->value);
+        if (!binding) {
+            return 0;
+        }
+        *out = binding->val;
+        return 1;
+    }
+    if (strcmp(node->type, "size") == 0 &&
+        node->left && strcmp(node->left->type, "id") == 0) {
+        ArrayInfo *info = find_array_info(ctx, node->left->value);
+        if (info && info->size > 0) {
+            out->kind = CONST_INT;
+            out->i = info->size;
+            out->d = 0.0;
+            out->s = NULL;
+            return 1;
+        }
+    }
+
+    if (strcmp(node->type, "not") == 0 || strcmp(node->type, "uminus") == 0) {
+        if (!eval_const_expr(ctx, node->left, &lhs)) {
+            return 0;
+        }
+        if (!const_is_numeric(&lhs)) {
+            return 0;
+        }
+        if (strcmp(node->type, "not") == 0) {
+            int b = 0;
+            if (!const_to_bool(&lhs, &b)) {
+                return 0;
+            }
+            out->kind = CONST_INT;
+            out->i = b ? 0 : 1;
+            out->d = 0.0;
+            out->s = NULL;
+            return 1;
+        }
+        if (lhs.kind == CONST_DECIMAL) {
+            if (!const_to_double(&lhs, &ld)) {
+                return 0;
+            }
+            out->kind = CONST_DECIMAL;
+            out->d = -ld;
+            out->i = 0;
+            out->s = NULL;
+            return 1;
+        }
+        if (!const_to_int(&lhs, &li)) {
+            return 0;
+        }
+        out->kind = CONST_INT;
+        out->i = -li;
+        out->d = 0.0;
+        out->s = NULL;
+        return 1;
+    }
+
+    if (strcmp(node->type, "+") == 0 || strcmp(node->type, "-") == 0 ||
+        strcmp(node->type, "*") == 0 || strcmp(node->type, "/") == 0 ||
+        strcmp(node->type, "%") == 0 ||
+        strcmp(node->type, "eq") == 0 || strcmp(node->type, "ne") == 0 ||
+        strcmp(node->type, "lt") == 0 || strcmp(node->type, "gt") == 0 ||
+        strcmp(node->type, "le") == 0 || strcmp(node->type, "ge") == 0 ||
+        strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0) {
+        if (!eval_const_expr(ctx, node->left, &lhs) ||
+            !eval_const_expr(ctx, node->right, &rhs)) {
+            return 0;
+        }
+        if (!const_is_numeric(&lhs) || !const_is_numeric(&rhs)) {
+            return 0;
+        }
+
+        if (strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0) {
+            int lb = 0;
+            int rb = 0;
+            if (!const_to_bool(&lhs, &lb) || !const_to_bool(&rhs, &rb)) {
+                return 0;
+            }
+            out->kind = CONST_INT;
+            out->i = (strcmp(node->type, "and") == 0) ? (lb && rb) : (lb || rb);
+            out->d = 0.0;
+            out->s = NULL;
+            return 1;
+        }
+
+        if (strcmp(node->type, "eq") == 0 || strcmp(node->type, "ne") == 0 ||
+            strcmp(node->type, "lt") == 0 || strcmp(node->type, "gt") == 0 ||
+            strcmp(node->type, "le") == 0 || strcmp(node->type, "ge") == 0) {
+            int result = 0;
+            if (lhs.kind == CONST_DECIMAL || rhs.kind == CONST_DECIMAL) {
+                if (!const_to_double(&lhs, &ld) || !const_to_double(&rhs, &rd)) {
+                    return 0;
+                }
+                if (strcmp(node->type, "eq") == 0) result = (ld == rd);
+                else if (strcmp(node->type, "ne") == 0) result = (ld != rd);
+                else if (strcmp(node->type, "lt") == 0) result = (ld < rd);
+                else if (strcmp(node->type, "gt") == 0) result = (ld > rd);
+                else if (strcmp(node->type, "le") == 0) result = (ld <= rd);
+                else if (strcmp(node->type, "ge") == 0) result = (ld >= rd);
+            } else {
+                if (!const_to_int(&lhs, &li) || !const_to_int(&rhs, &ri)) {
+                    return 0;
+                }
+                if (strcmp(node->type, "eq") == 0) result = (li == ri);
+                else if (strcmp(node->type, "ne") == 0) result = (li != ri);
+                else if (strcmp(node->type, "lt") == 0) result = (li < ri);
+                else if (strcmp(node->type, "gt") == 0) result = (li > ri);
+                else if (strcmp(node->type, "le") == 0) result = (li <= ri);
+                else if (strcmp(node->type, "ge") == 0) result = (li >= ri);
+            }
+            out->kind = CONST_INT;
+            out->i = result;
+            out->d = 0.0;
+            out->s = NULL;
+            return 1;
+        }
+
+        if (strcmp(node->type, "%") == 0) {
+            if (!const_to_int(&lhs, &li) || !const_to_int(&rhs, &ri)) {
+                return 0;
+            }
+            if (ri == 0) {
+                return 0;
+            }
+            out->kind = CONST_INT;
+            out->i = li % ri;
+            out->d = 0.0;
+            out->s = NULL;
+            return 1;
+        }
+
+        if (lhs.kind == CONST_DECIMAL || rhs.kind == CONST_DECIMAL) {
+            if (!const_to_double(&lhs, &ld) || !const_to_double(&rhs, &rd)) {
+                return 0;
+            }
+            if (strcmp(node->type, "/") == 0 && rd == 0.0) {
+                return 0;
+            }
+            out->kind = CONST_DECIMAL;
+            if (strcmp(node->type, "+") == 0) out->d = ld + rd;
+            else if (strcmp(node->type, "-") == 0) out->d = ld - rd;
+            else if (strcmp(node->type, "*") == 0) out->d = ld * rd;
+            else if (strcmp(node->type, "/") == 0) out->d = ld / rd;
+            else return 0;
+            out->i = 0;
+            out->s = NULL;
+            return 1;
+        }
+
+        if (!const_to_int(&lhs, &li) || !const_to_int(&rhs, &ri)) {
+            return 0;
+        }
+        if (strcmp(node->type, "/") == 0 && ri == 0) {
+            return 0;
+        }
+        out->kind = CONST_INT;
+        if (strcmp(node->type, "+") == 0) out->i = li + ri;
+        else if (strcmp(node->type, "-") == 0) out->i = li - ri;
+        else if (strcmp(node->type, "*") == 0) out->i = li * ri;
+        else if (strcmp(node->type, "/") == 0) out->i = li / ri;
+        else return 0;
+        out->d = 0.0;
+        out->s = NULL;
+        return 1;
+    }
+
+    return 0;
 }
 
 static void collect_matrix_decls(IRContext *ctx, ASTNode *node)
@@ -1610,33 +2518,89 @@ static int emit_lvalue_addr(IRContext *ctx, ASTNode *node, FILE *out)
     return -1;
 }
 
-static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
+static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCache **cache, int cse_enabled)
 {
+    ConstVal folded;
+    char *key = NULL;
+
     if (!node) {
         return -1;
     }
+    if (cse_enabled && cache) {
+        key = expr_key(node);
+        if (key) {
+            ExprCache *hit = expr_cache_find(*cache, key);
+            if (hit) {
+                free(key);
+                return hit->temp;
+            }
+        }
+    }
+    if (eval_const_expr(ctx, node, &folded)) {
+        int temp = emit_const_value(ctx, &folded, out);
+        if (cse_enabled && cache && key && temp >= 0) {
+            expr_cache_add(cache, key, temp);
+            return temp;
+        }
+        free(key);
+        return temp;
+    }
 
     if (strcmp(node->type, "int") == 0) {
-        return emit_const(ctx, "int", node->value, out);
+        int temp = emit_const(ctx, "int", node->value, out);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, temp);
+            return temp;
+        }
+        free(key);
+        return temp;
     }
     if (strcmp(node->type, "decimal") == 0) {
-        return emit_const(ctx, "decimal", node->value, out);
+        int temp = emit_const(ctx, "decimal", node->value, out);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, temp);
+            return temp;
+        }
+        free(key);
+        return temp;
     }
     if (strcmp(node->type, "char") == 0) {
-        return emit_const(ctx, "char", node->value, out);
+        int temp = emit_const(ctx, "char", node->value, out);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, temp);
+            return temp;
+        }
+        free(key);
+        return temp;
     }
     if (strcmp(node->type, "string") == 0) {
-        return emit_const(ctx, "string", node->value, out);
+        int temp = emit_const(ctx, "string", node->value, out);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, temp);
+            return temp;
+        }
+        free(key);
+        return temp;
     }
     if (strcmp(node->type, "id") == 0) {
         int t = new_temp(ctx);
         ir_printf(ctx, out, "t%d = load %s", t, safe_str(node->value));
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, t);
+            return t;
+        }
+        free(key);
         return t;
     }
     if (strcmp(node->type, "array_access") == 0 || strcmp(node->type, "matrix_access") == 0) {
         int addr = emit_lvalue_addr(ctx, node, out);
         int t = new_temp(ctx);
         ir_printf(ctx, out, "t%d = load [t%d]", t, addr);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, t);
+            return t;
+        }
+        free(key);
         return t;
     }
     if (strcmp(node->type, "+") == 0 || strcmp(node->type, "-") == 0 ||
@@ -1646,16 +2610,125 @@ static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
         strcmp(node->type, "lt") == 0 || strcmp(node->type, "gt") == 0 ||
         strcmp(node->type, "le") == 0 || strcmp(node->type, "ge") == 0 ||
         strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0) {
-        int lhs = emit_expr(ctx, node->left, out);
-        int rhs = emit_expr(ctx, node->right, out);
+        ConstVal left_val;
+        ConstVal right_val;
+        int left_is_const = eval_const_expr(ctx, node->left, &left_val);
+        int right_is_const = eval_const_expr(ctx, node->right, &right_val);
+
+        if ((strcmp(node->type, "+") == 0 || strcmp(node->type, "*") == 0) &&
+            left_is_const && !right_is_const) {
+            ASTNode *tmp = node->left;
+            node->left = node->right;
+            node->right = tmp;
+            ConstVal tmp_val = left_val;
+            left_val = right_val;
+            right_val = tmp_val;
+            left_is_const = right_is_const;
+            right_is_const = 1;
+        }
+
+        if (strcmp(node->type, "+") == 0) {
+            if (right_is_const && const_is_zero(&right_val)) {
+                int t = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                free(key);
+                return t;
+            }
+        }
+        if (strcmp(node->type, "-") == 0) {
+            if (right_is_const && const_is_zero(&right_val)) {
+                int t = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                free(key);
+                return t;
+            }
+            if (left_is_const && const_is_zero(&left_val)) {
+                int v = emit_expr_internal(ctx, node->right, out, cache, cse_enabled);
+                int t = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = uminus t%d", t, v);
+                if (cse_enabled && cache && key) {
+                    expr_cache_add(cache, key, t);
+                    return t;
+                }
+                free(key);
+                return t;
+            }
+        }
+        if (strcmp(node->type, "*") == 0) {
+            if (right_is_const && const_is_zero(&right_val)) {
+                int t = emit_const(ctx, "int", "0", out);
+                if (cse_enabled && cache && key) {
+                    expr_cache_add(cache, key, t);
+                    return t;
+                }
+                free(key);
+                return t;
+            }
+            if (right_is_const && const_is_one(&right_val)) {
+                int t = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                free(key);
+                return t;
+            }
+            if (right_is_const && const_is_neg_one(&right_val)) {
+                int v = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                int t = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = uminus t%d", t, v);
+                if (cse_enabled && cache && key) {
+                    expr_cache_add(cache, key, t);
+                    return t;
+                }
+                free(key);
+                return t;
+            }
+            if (right_is_const && right_val.kind == CONST_INT && right_val.i == 2) {
+                int v = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                int t = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", t, v, v);
+                if (cse_enabled && cache && key) {
+                    expr_cache_add(cache, key, t);
+                    return t;
+                }
+                free(key);
+                return t;
+            }
+        }
+        if (strcmp(node->type, "/") == 0) {
+            if (right_is_const && const_is_one(&right_val)) {
+                int t = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                free(key);
+                return t;
+            }
+            if (right_is_const && const_is_neg_one(&right_val)) {
+                int v = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+                int t = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = uminus t%d", t, v);
+                if (cse_enabled && cache && key) {
+                    expr_cache_add(cache, key, t);
+                    return t;
+                }
+                free(key);
+                return t;
+            }
+        }
+
+        int lhs = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+        int rhs = emit_expr_internal(ctx, node->right, out, cache, cse_enabled);
         int t = new_temp(ctx);
         ir_printf(ctx, out, "t%d = %s t%d, t%d", t, node->type, lhs, rhs);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, t);
+            return t;
+        }
+        free(key);
         return t;
     }
     if (strcmp(node->type, "not") == 0 || strcmp(node->type, "uminus") == 0) {
-        int v = emit_expr(ctx, node->left, out);
+        int v = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
         int t = new_temp(ctx);
         ir_printf(ctx, out, "t%d = %s t%d", t, node->type, v);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, t);
+            return t;
+        }
+        free(key);
         return t;
     }
     if (strcmp(node->type, "size") == 0 ||
@@ -1669,7 +2742,13 @@ static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
             if (info && info->size > 0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "%d", info->size);
-                return emit_const(ctx, "int", buf, out);
+                int t = emit_const(ctx, "int", buf, out);
+                if (cse_enabled && cache && key) {
+                    expr_cache_add(cache, key, t);
+                    return t;
+                }
+                free(key);
+                return t;
             }
         }
         if (strcmp(node->type, "det") == 0 && node->left && strcmp(node->left->type, "id") == 0) {
@@ -1677,26 +2756,55 @@ static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
             if (info && info->rows > 0 && info->cols > 0 && info->rows == info->cols) {
                 int det_val = emit_matrix_det(ctx, node->left->value, info->rows, out);
                 if (det_val >= 0) {
+                    if (cse_enabled && cache && key) {
+                        expr_cache_add(cache, key, det_val);
+                        return det_val;
+                    }
+                    free(key);
                     return det_val;
                 }
             }
         }
-        int v = emit_expr(ctx, node->left, out);
+        int v = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
         int t = new_temp(ctx);
         ir_printf(ctx, out, "t%d = %s t%d", t, node->type, v);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, t);
+            return t;
+        }
+        free(key);
         return t;
     }
     if (strcmp(node->type, "matadd") == 0 ||
         strcmp(node->type, "matsub") == 0 ||
         strcmp(node->type, "matmul") == 0) {
-        int a = emit_expr(ctx, node->left, out);
-        int b = emit_expr(ctx, node->right, out);
+        int a = emit_expr_internal(ctx, node->left, out, cache, cse_enabled);
+        int b = emit_expr_internal(ctx, node->right, out, cache, cse_enabled);
         int t = new_temp(ctx);
         ir_printf(ctx, out, "t%d = %s t%d, t%d", t, node->type, a, b);
+        if (cse_enabled && cache && key) {
+            expr_cache_add(cache, key, t);
+            return t;
+        }
+        free(key);
         return t;
     }
     if (strcmp(node->type, "pre_inc") == 0 || strcmp(node->type, "pre_dec") == 0 ||
         strcmp(node->type, "post_inc") == 0 || strcmp(node->type, "post_dec") == 0) {
+        const char *lvalue_name = NULL;
+        ConstBinding *binding = NULL;
+        ConstVal old_val;
+        int has_old = 0;
+        if (node->left && strcmp(node->left->type, "id") == 0) {
+            lvalue_name = node->left->value;
+            binding = const_find_binding(ctx, lvalue_name);
+            if (binding) {
+                old_val = binding->val;
+                has_old = 1;
+            }
+            const_unbind(ctx, lvalue_name);
+        }
+
         int addr = emit_lvalue_addr(ctx, node->left, out);
         int cur = new_temp(ctx);
         int next = new_temp(ctx);
@@ -1712,16 +2820,51 @@ static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
         } else {
             ir_printf(ctx, out, "t%d = mov t%d", result, cur);
         }
+        if (lvalue_name && has_old && const_is_numeric(&old_val)) {
+            ConstVal new_val;
+            long long li = 0;
+            double ld = 0.0;
+            int delta_sign = (strstr(node->type, "inc") != NULL) ? 1 : -1;
+            if (old_val.kind == CONST_DECIMAL) {
+                if (const_to_double(&old_val, &ld)) {
+                    new_val.kind = CONST_DECIMAL;
+                    new_val.d = ld + (double) delta_sign;
+                    new_val.i = 0;
+                    new_val.s = NULL;
+                    const_bind(ctx, lvalue_name, &new_val);
+                }
+            } else if (const_to_int(&old_val, &li)) {
+                new_val.kind = CONST_INT;
+                new_val.i = li + delta_sign;
+                new_val.d = 0.0;
+                new_val.s = NULL;
+                const_bind(ctx, lvalue_name, &new_val);
+            }
+        }
         return result;
     }
 
+    free(key);
     return -1;
+}
+
+static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
+{
+    return emit_expr_internal(ctx, node, out, &ctx->cse_cache, 1);
 }
 
 static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
 {
+    const char *lhs_name = NULL;
+    int lhs_is_scalar = 0;
+
     if (!node) {
         return;
+    }
+    lhs_name = node->value;
+    if (lhs_name && !find_matrix_info(ctx, lhs_name) && !find_array_info(ctx, lhs_name)) {
+        lhs_is_scalar = 1;
+        const_unbind(ctx, lhs_name);
     }
     if (node->value) {
         MatrixInfo *lhs_info = find_matrix_info(ctx, node->value);
@@ -1738,6 +2881,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     cols = src_info->rows;
                 }
                 if (src_info && emit_matrix_transpose(ctx, node->value, src_name, rows, cols, out)) {
+                    cse_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -1746,6 +2890,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                 MatrixInfo *src_info = find_matrix_info(ctx, src_name);
                 if (src_info && src_info->rows > 0 && src_info->cols > 0 && src_info->rows == src_info->cols) {
                     if (emit_matrix_inverse(ctx, node->value, src_name, src_info->rows, out)) {
+                        cse_invalidate_name(ctx, node->value);
                         return;
                     }
                 }
@@ -1760,12 +2905,14 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     if (strcmp(rhs_node->type, "matmul") == 0) {
                         if (emit_matrix_mul(ctx, node->value, left_name, right_name,
                                             left_info->rows, left_info->cols, right_info->cols, out)) {
+                            cse_invalidate_name(ctx, node->value);
                             return;
                         }
                     } else {
                         const char *op = (strcmp(rhs_node->type, "matadd") == 0) ? "+" : "-";
                         if (emit_matrix_add_sub(ctx, node->value, left_name, right_name,
                                                 left_info->rows, left_info->cols, op, out)) {
+                            cse_invalidate_name(ctx, node->value);
                             return;
                         }
                     }
@@ -1780,6 +2927,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     cols = rhs_info->cols;
                 }
                 if (rhs_info && emit_matrix_copy(ctx, node->value, rhs_node->value, rows, cols, out)) {
+                    cse_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -1796,6 +2944,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     emit_array_copy(ctx, node->value, src_name, size, out);
                 }
                 if (emit_array_sort(ctx, node->value, size, out)) {
+                    cse_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -1808,6 +2957,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
             }
             if (rhs_arr && size > 0) {
                 if (emit_array_copy(ctx, node->value, rhs_node->value, size, out)) {
+                    cse_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -1828,6 +2978,10 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     id_node.value = node->value;
                     addr = emit_lvalue_addr(ctx, &id_node, out);
                     ir_printf(ctx, out, "store [t%d], t%d", addr, det_temp);
+                    if (lhs_is_scalar) {
+                        const_unbind(ctx, lhs_name);
+                    }
+                    cse_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -1846,6 +3000,17 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
     ASTNode *rhs_node = node->right ? node->right : node->left;
     int rhs = emit_expr(ctx, rhs_node, out);
     ir_printf(ctx, out, "store [t%d], t%d", addr, rhs);
+    if (lhs_is_scalar) {
+        ConstVal val;
+        if (eval_const_expr(ctx, rhs_node, &val)) {
+            const_bind(ctx, lhs_name, &val);
+        }
+        cse_invalidate_name(ctx, lhs_name);
+    } else if (node->value) {
+        cse_invalidate_name(ctx, node->value);
+    } else if (node->left && node->left->value) {
+        cse_invalidate_name(ctx, node->left->value);
+    }
 }
 
 static void emit_decl(IRContext *ctx, ASTNode *node, FILE *out)
@@ -1855,6 +3020,9 @@ static void emit_decl(IRContext *ctx, ASTNode *node, FILE *out)
     }
     const char *type = safe_str(node->left ? node->left->value : NULL);
     const char *name = safe_str(node->right ? node->right->value : NULL);
+    if (name && name[0] != '\0') {
+        const_unbind(ctx, name);
+    }
     ir_printf(ctx, out, "decl %s %s", type, name);
 }
 
@@ -1898,40 +3066,372 @@ static void emit_if_else_chain(IRContext *ctx, ASTNode *node, FILE *out, int bre
     if (!node) {
         return;
     }
+    cse_clear(ctx);
     if (strcmp(node->type, "if_else") == 0) {
         int else_label = new_label(ctx);
         int end_label = new_label(ctx);
         ASTNode *left = node->left;
         if (left && strcmp(left->type, "if") == 0) {
-            int cond = emit_expr(ctx, left->left, out);
-            ir_printf(ctx, out, "ifz t%d goto L%d", cond, else_label);
-            emit_stmt(ctx, left->right, out, break_label, continue_label);
-            ir_printf(ctx, out, "goto L%d", end_label);
-            ir_printf(ctx, out, "label L%d", else_label);
-            emit_if_else_chain(ctx, node->right, out, break_label, continue_label);
-            ir_printf(ctx, out, "label L%d", end_label);
-            return;
+            ConstVal folded;
+            int cond_bool = 0;
+            if (eval_const_expr(ctx, left->left, &folded) &&
+                const_to_bool(&folded, &cond_bool)) {
+                if (cond_bool) {
+                    emit_stmt(ctx, left->right, out, break_label, continue_label);
+                } else {
+                    emit_if_else_chain(ctx, node->right, out, break_label, continue_label);
+                }
+                return;
+            }
+            {
+                ConstBinding *orig = const_clone_list(ctx->consts);
+                ConstBinding *then_consts = NULL;
+                ConstBinding *else_consts = NULL;
+
+                int cond = emit_expr(ctx, left->left, out);
+                ir_printf(ctx, out, "ifz t%d goto L%d", cond, else_label);
+
+                const_set(ctx, const_clone_list(orig));
+                emit_stmt(ctx, left->right, out, break_label, continue_label);
+                then_consts = ctx->consts;
+                ctx->consts = NULL;
+
+                ir_printf(ctx, out, "goto L%d", end_label);
+                ir_printf(ctx, out, "label L%d", else_label);
+
+                const_set(ctx, const_clone_list(orig));
+                emit_if_else_chain(ctx, node->right, out, break_label, continue_label);
+                else_consts = ctx->consts;
+                ctx->consts = NULL;
+
+                ir_printf(ctx, out, "label L%d", end_label);
+
+                const_set(ctx, const_intersect(then_consts, else_consts));
+                const_free_list(then_consts);
+                const_free_list(else_consts);
+                const_free_list(orig);
+                return;
+            }
         }
         if (left) {
-            int cond = emit_expr(ctx, left, out);
-            ir_printf(ctx, out, "ifz t%d goto L%d", cond, else_label);
-            emit_stmt(ctx, node->right, out, break_label, continue_label);
-            ir_printf(ctx, out, "goto L%d", end_label);
-            ir_printf(ctx, out, "label L%d", else_label);
-            emit_stmt(ctx, node->third, out, break_label, continue_label);
-            ir_printf(ctx, out, "label L%d", end_label);
-            return;
+            ConstVal folded;
+            int cond_bool = 0;
+            if (eval_const_expr(ctx, left, &folded) &&
+                const_to_bool(&folded, &cond_bool)) {
+                if (cond_bool) {
+                    emit_stmt(ctx, node->right, out, break_label, continue_label);
+                } else {
+                    emit_stmt(ctx, node->third, out, break_label, continue_label);
+                }
+                return;
+            }
+            {
+                ConstBinding *orig = const_clone_list(ctx->consts);
+                ConstBinding *then_consts = NULL;
+                ConstBinding *else_consts = NULL;
+
+                int cond = emit_expr(ctx, left, out);
+                ir_printf(ctx, out, "ifz t%d goto L%d", cond, else_label);
+
+                const_set(ctx, const_clone_list(orig));
+                emit_stmt(ctx, node->right, out, break_label, continue_label);
+                then_consts = ctx->consts;
+                ctx->consts = NULL;
+
+                ir_printf(ctx, out, "goto L%d", end_label);
+                ir_printf(ctx, out, "label L%d", else_label);
+
+                const_set(ctx, const_clone_list(orig));
+                emit_stmt(ctx, node->third, out, break_label, continue_label);
+                else_consts = ctx->consts;
+                ctx->consts = NULL;
+
+                ir_printf(ctx, out, "label L%d", end_label);
+
+                const_set(ctx, const_intersect(then_consts, else_consts));
+                const_free_list(then_consts);
+                const_free_list(else_consts);
+                const_free_list(orig);
+                return;
+            }
         }
     }
     if (strcmp(node->type, "if") == 0) {
-        int end_label = new_label(ctx);
-        int cond = emit_expr(ctx, node->left, out);
-        ir_printf(ctx, out, "ifz t%d goto L%d", cond, end_label);
-        emit_stmt(ctx, node->right, out, break_label, continue_label);
-        ir_printf(ctx, out, "label L%d", end_label);
-        return;
+        ConstVal folded;
+        int cond_bool = 0;
+        if (eval_const_expr(ctx, node->left, &folded) &&
+            const_to_bool(&folded, &cond_bool)) {
+            if (cond_bool) {
+                emit_stmt(ctx, node->right, out, break_label, continue_label);
+            }
+            return;
+        }
+        {
+            int end_label = new_label(ctx);
+            ConstBinding *orig = const_clone_list(ctx->consts);
+            ConstBinding *then_consts = NULL;
+
+            int cond = emit_expr(ctx, node->left, out);
+            ir_printf(ctx, out, "ifz t%d goto L%d", cond, end_label);
+            const_set(ctx, const_clone_list(orig));
+            emit_stmt(ctx, node->right, out, break_label, continue_label);
+            then_consts = ctx->consts;
+            ctx->consts = NULL;
+            ir_printf(ctx, out, "label L%d", end_label);
+
+            const_set(ctx, const_intersect(then_consts, orig));
+            const_free_list(then_consts);
+            const_free_list(orig);
+            return;
+        }
     }
     emit_stmt(ctx, node, out, break_label, continue_label);
+}
+
+static int contains_break_or_continue(ASTNode *node)
+{
+    if (!node || !node->type) {
+        return 0;
+    }
+    if (strcmp(node->type, "break") == 0 || strcmp(node->type, "continue") == 0) {
+        return 1;
+    }
+    return contains_break_or_continue(node->left) ||
+           contains_break_or_continue(node->right) ||
+           contains_break_or_continue(node->third);
+}
+
+static int modifies_var(ASTNode *node, const char *name)
+{
+    if (!node || !node->type || !name) {
+        return 0;
+    }
+    if (strcmp(node->type, "assign") == 0) {
+        if (node->value && strcmp(node->value, name) == 0) {
+            return 1;
+        }
+        if (!node->value && node->left &&
+            strcmp(node->left->type, "id") == 0 &&
+            node->left->value && strcmp(node->left->value, name) == 0) {
+            return 1;
+        }
+    }
+    if (strcmp(node->type, "pre_inc") == 0 || strcmp(node->type, "pre_dec") == 0 ||
+        strcmp(node->type, "post_inc") == 0 || strcmp(node->type, "post_dec") == 0) {
+        if (node->left && strcmp(node->left->type, "id") == 0 &&
+            node->left->value && strcmp(node->left->value, name) == 0) {
+            return 1;
+        }
+    }
+    if (strcmp(node->type, "scan") == 0) {
+        if (node->left && strcmp(node->left->type, "id") == 0 &&
+            node->left->value && strcmp(node->left->value, name) == 0) {
+            return 1;
+        }
+    }
+    return modifies_var(node->left, name) ||
+           modifies_var(node->right, name) ||
+           modifies_var(node->third, name);
+}
+
+static int extract_loop_init(IRContext *ctx, ASTNode *init, const char **var_name, long long *start)
+{
+    ConstVal val;
+
+    if (!ctx || !init || !var_name || !start) {
+        return 0;
+    }
+    if (strcmp(init->type, "assign") != 0) {
+        return 0;
+    }
+    if (!init->left || strcmp(init->left->type, "id") != 0 || !init->left->value) {
+        return 0;
+    }
+    if (!eval_const_expr(ctx, init->right, &val) || !const_to_int(&val, start)) {
+        return 0;
+    }
+    *var_name = init->left->value;
+    return 1;
+}
+
+static int extract_loop_condition(IRContext *ctx, ASTNode *cond, const char *var_name,
+                                  long long *bound, int *inclusive, int *direction)
+{
+    ConstVal val;
+
+    if (!ctx || !cond || !var_name || !bound || !inclusive || !direction) {
+        return 0;
+    }
+    if (!(strcmp(cond->type, "lt") == 0 || strcmp(cond->type, "le") == 0 ||
+          strcmp(cond->type, "gt") == 0 || strcmp(cond->type, "ge") == 0)) {
+        return 0;
+    }
+    if (!cond->left || strcmp(cond->left->type, "id") != 0 || !cond->left->value) {
+        return 0;
+    }
+    if (strcmp(cond->left->value, var_name) != 0) {
+        return 0;
+    }
+    if (!eval_const_expr(ctx, cond->right, &val) || !const_to_int(&val, bound)) {
+        return 0;
+    }
+    if (strcmp(cond->type, "lt") == 0 || strcmp(cond->type, "le") == 0) {
+        *direction = 1;
+        *inclusive = (strcmp(cond->type, "le") == 0);
+        return 1;
+    }
+    *direction = -1;
+    *inclusive = (strcmp(cond->type, "ge") == 0);
+    return 1;
+}
+
+static int extract_loop_step(IRContext *ctx, ASTNode *update, const char *var_name, long long *step)
+{
+    ConstVal val;
+
+    if (!ctx || !update || !var_name || !step) {
+        return 0;
+    }
+    if ((strcmp(update->type, "pre_inc") == 0 || strcmp(update->type, "post_inc") == 0) &&
+        update->left && strcmp(update->left->type, "id") == 0 &&
+        update->left->value && strcmp(update->left->value, var_name) == 0) {
+        *step = 1;
+        return 1;
+    }
+    if ((strcmp(update->type, "pre_dec") == 0 || strcmp(update->type, "post_dec") == 0) &&
+        update->left && strcmp(update->left->type, "id") == 0 &&
+        update->left->value && strcmp(update->left->value, var_name) == 0) {
+        *step = -1;
+        return 1;
+    }
+    if (strcmp(update->type, "assign") == 0 &&
+        update->left && strcmp(update->left->type, "id") == 0 &&
+        update->left->value && strcmp(update->left->value, var_name) == 0 &&
+        update->right && update->right->type) {
+        ASTNode *rhs = update->right;
+        if (strcmp(rhs->type, "+") == 0 || strcmp(rhs->type, "-") == 0) {
+            ASTNode *lhs = rhs->left;
+            ASTNode *r = rhs->right;
+            if (lhs && r && lhs->type && r->type) {
+                if (strcmp(lhs->type, "id") == 0 && lhs->value &&
+                    strcmp(lhs->value, var_name) == 0 &&
+                    eval_const_expr(ctx, r, &val) && const_to_int(&val, step)) {
+                    if (strcmp(rhs->type, "-") == 0) {
+                        *step = -*step;
+                    }
+                    return (*step != 0);
+                }
+                if (strcmp(rhs->type, "+") == 0 &&
+                    strcmp(r->type, "id") == 0 && r->value &&
+                    strcmp(r->value, var_name) == 0 &&
+                    eval_const_expr(ctx, lhs, &val) && const_to_int(&val, step)) {
+                    return (*step != 0);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int compute_unroll_count(long long start, long long bound, long long step,
+                                int inclusive, int direction, int *count)
+{
+    long long diff;
+    long long step_abs;
+
+    if (!count || step == 0) {
+        return 0;
+    }
+    if (direction > 0) {
+        if (step <= 0) {
+            return 0;
+        }
+        if (inclusive) {
+            if (start > bound) {
+                *count = 0;
+                return 1;
+            }
+            diff = bound - start;
+            *count = (int) (diff / step + 1);
+            return 1;
+        }
+        if (start >= bound) {
+            *count = 0;
+            return 1;
+        }
+        diff = bound - start;
+        *count = (int) ((diff + step - 1) / step);
+        return 1;
+    }
+    if (step >= 0) {
+        return 0;
+    }
+    step_abs = -step;
+    if (inclusive) {
+        if (start < bound) {
+            *count = 0;
+            return 1;
+        }
+        diff = start - bound;
+        *count = (int) (diff / step_abs + 1);
+        return 1;
+    }
+    if (start <= bound) {
+        *count = 0;
+        return 1;
+    }
+    diff = start - bound;
+    *count = (int) ((diff + step_abs - 1) / step_abs);
+    return 1;
+}
+
+static int emit_for_body_unrolled(IRContext *ctx, ASTNode *node, FILE *out)
+{
+    const char *var_name = NULL;
+    long long start = 0;
+    long long bound = 0;
+    long long step = 0;
+    int inclusive = 0;
+    int direction = 0;
+    int count = 0;
+
+    if (!ctx || !node || !out || !node->left) {
+        return 0;
+    }
+    ASTNode *for_node = node->left;
+    ASTNode *body = node->right;
+    if (!for_node || strcmp(for_node->type, "for") != 0) {
+        return 0;
+    }
+    if (!extract_loop_init(ctx, for_node->left, &var_name, &start)) {
+        return 0;
+    }
+    if (!extract_loop_condition(ctx, for_node->right, var_name, &bound, &inclusive, &direction)) {
+        return 0;
+    }
+    if (!extract_loop_step(ctx, for_node->third, var_name, &step)) {
+        return 0;
+    }
+    if (!compute_unroll_count(start, bound, step, inclusive, direction, &count)) {
+        return 0;
+    }
+    if (contains_break_or_continue(body)) {
+        return 0;
+    }
+    if (modifies_var(body, var_name)) {
+        return 0;
+    }
+    if (count > 8) {
+        return 0;
+    }
+
+    emit_stmt(ctx, for_node->left, out, -1, -1);
+    for (int i = 0; i < count; i++) {
+        emit_stmt(ctx, body, out, -1, -1);
+        emit_stmt(ctx, for_node->third, out, -1, -1);
+    }
+    const_clear(ctx);
+    return 1;
 }
 
 static void emit_for_body(IRContext *ctx, ASTNode *node, FILE *out)
@@ -1941,10 +3441,26 @@ static void emit_for_body(IRContext *ctx, ASTNode *node, FILE *out)
     int start_label = new_label(ctx);
     int end_label = new_label(ctx);
     int continue_label = new_label(ctx);
+    int cond_is_const = 0;
+    int cond_bool = 0;
+    ConstVal folded;
+
+    cse_clear(ctx);
+    if (emit_for_body_unrolled(ctx, node, out)) {
+        return;
+    }
 
     emit_stmt(ctx, for_node->left, out, end_label, continue_label);
+    if (for_node->right && eval_const_expr(ctx, for_node->right, &folded) &&
+        const_to_bool(&folded, &cond_bool)) {
+        cond_is_const = 1;
+        if (!cond_bool) {
+            return;
+        }
+    }
+
     ir_printf(ctx, out, "label L%d", start_label);
-    if (for_node->right) {
+    if (for_node->right && !(cond_is_const && cond_bool)) {
         int cond = emit_expr(ctx, for_node->right, out);
         ir_printf(ctx, out, "ifz t%d goto L%d", cond, end_label);
     }
@@ -1953,6 +3469,7 @@ static void emit_for_body(IRContext *ctx, ASTNode *node, FILE *out)
     emit_stmt(ctx, for_node->third, out, end_label, continue_label);
     ir_printf(ctx, out, "goto L%d", start_label);
     ir_printf(ctx, out, "label L%d", end_label);
+    const_clear(ctx);
 }
 
 static void emit_while(IRContext *ctx, ASTNode *node, FILE *out)
@@ -1960,23 +3477,38 @@ static void emit_while(IRContext *ctx, ASTNode *node, FILE *out)
     int start_label = new_label(ctx);
     int end_label = new_label(ctx);
     int continue_label = new_label(ctx);
+    int cond_is_const = 0;
+    int cond_bool = 0;
+    ConstVal folded;
+
+    cse_clear(ctx);
+    if (eval_const_expr(ctx, node->left, &folded) &&
+        const_to_bool(&folded, &cond_bool)) {
+        cond_is_const = 1;
+        if (!cond_bool) {
+            return;
+        }
+    }
     ir_printf(ctx, out, "label L%d", start_label);
-    int cond = emit_expr(ctx, node->left, out);
-    ir_printf(ctx, out, "ifz t%d goto L%d", cond, end_label);
+    if (!cond_is_const) {
+        int cond = emit_expr(ctx, node->left, out);
+        ir_printf(ctx, out, "ifz t%d goto L%d", cond, end_label);
+    }
     emit_stmt(ctx, node->right, out, end_label, continue_label);
     ir_printf(ctx, out, "label L%d", continue_label);
     ir_printf(ctx, out, "goto L%d", start_label);
     ir_printf(ctx, out, "label L%d", end_label);
+    const_clear(ctx);
 }
 
-static void emit_switch_cases(IRContext *ctx, ASTNode *node, FILE *out, int switch_temp, int end_label)
+static void emit_switch_cases(IRContext *ctx, ASTNode *node, FILE *out, int switch_temp, int end_label, ConstBinding *orig_consts)
 {
     if (!node) {
         return;
     }
     if (strcmp(node->type, "cases") == 0) {
-        emit_switch_cases(ctx, node->left, out, switch_temp, end_label);
-        emit_switch_cases(ctx, node->right, out, switch_temp, end_label);
+        emit_switch_cases(ctx, node->left, out, switch_temp, end_label, orig_consts);
+        emit_switch_cases(ctx, node->right, out, switch_temp, end_label, orig_consts);
         return;
     }
     if (strcmp(node->type, "case") == 0) {
@@ -1987,7 +3519,9 @@ static void emit_switch_cases(IRContext *ctx, ASTNode *node, FILE *out, int swit
         ir_printf(ctx, out, "t%d = eq t%d, t%d", cmp, switch_temp, val);
         ir_printf(ctx, out, "ifz t%d goto L%d", cmp, next_label);
         ir_printf(ctx, out, "label L%d", case_label);
+        const_set(ctx, const_clone_list(orig_consts));
         emit_stmt(ctx, node->right, out, end_label, -1);
+        const_set(ctx, NULL);
         ir_printf(ctx, out, "goto L%d", end_label);
         ir_printf(ctx, out, "label L%d", next_label);
         return;
@@ -1995,17 +3529,78 @@ static void emit_switch_cases(IRContext *ctx, ASTNode *node, FILE *out, int swit
     if (strcmp(node->type, "default") == 0) {
         int def_label = new_label(ctx);
         ir_printf(ctx, out, "label L%d", def_label);
+        const_set(ctx, const_clone_list(orig_consts));
         emit_stmt(ctx, node->left, out, end_label, -1);
+        const_set(ctx, NULL);
         return;
     }
 }
 
+static ASTNode *find_const_case(IRContext *ctx, ASTNode *node, const ConstVal *switch_val, ASTNode **default_node)
+{
+    ConstVal case_val;
+
+    if (!node) {
+        return NULL;
+    }
+    if (strcmp(node->type, "cases") == 0) {
+        ASTNode *found = find_const_case(ctx, node->left, switch_val, default_node);
+        if (found) {
+            return found;
+        }
+        return find_const_case(ctx, node->right, switch_val, default_node);
+    }
+    if (strcmp(node->type, "case") == 0) {
+        if (eval_const_expr(ctx, node->left, &case_val) &&
+            const_compare_equal(&case_val, switch_val)) {
+            return node->right;
+        }
+        return NULL;
+    }
+    if (strcmp(node->type, "default") == 0) {
+        if (default_node) {
+            *default_node = node->left;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
 static void emit_switch(IRContext *ctx, ASTNode *node, FILE *out)
 {
-    int end_label = new_label(ctx);
-    int switch_temp = emit_expr(ctx, node->left, out);
-    emit_switch_cases(ctx, node->right, out, switch_temp, end_label);
+    int end_label;
+    int switch_temp;
+    ConstVal folded;
+    ASTNode *default_node = NULL;
+    ASTNode *case_node = NULL;
+
+    if (!node) {
+        return;
+    }
+
+    cse_clear(ctx);
+    if (eval_const_expr(ctx, node->left, &folded)) {
+        case_node = find_const_case(ctx, node->right, &folded, &default_node);
+        if (case_node) {
+            emit_stmt(ctx, case_node, out, -1, -1);
+            return;
+        }
+        if (default_node) {
+            emit_stmt(ctx, default_node, out, -1, -1);
+            return;
+        }
+        return;
+    }
+
+    end_label = new_label(ctx);
+    switch_temp = emit_expr(ctx, node->left, out);
+    {
+        ConstBinding *orig = const_clone_list(ctx->consts);
+        emit_switch_cases(ctx, node->right, out, switch_temp, end_label, orig);
+        const_free_list(orig);
+    }
     ir_printf(ctx, out, "label L%d", end_label);
+    const_clear(ctx);
 }
 
 static void emit_print_args(IRContext *ctx, ASTNode *node, FILE *out)
@@ -2078,14 +3673,13 @@ static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label,
     if (strcmp(node->type, "pre_inc") == 0 || strcmp(node->type, "pre_dec") == 0 ||
         strcmp(node->type, "post_inc") == 0 || strcmp(node->type, "post_dec") == 0) {
         emit_expr(ctx, node, out);
+        if (node->left && node->left->value) {
+            cse_invalidate_name(ctx, node->left->value);
+        }
         return;
     }
     if (strcmp(node->type, "if") == 0) {
-        int end_label = new_label(ctx);
-        int cond = emit_expr(ctx, node->left, out);
-        ir_printf(ctx, out, "ifz t%d goto L%d", cond, end_label);
-        emit_stmt(ctx, node->right, out, break_label, continue_label);
-        ir_printf(ctx, out, "label L%d", end_label);
+        emit_if_else_chain(ctx, node, out, break_label, continue_label);
         return;
     }
     if (strcmp(node->type, "if_else") == 0) {
@@ -2132,6 +3726,12 @@ static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label,
     if (strcmp(node->type, "scan") == 0) {
         int addr = emit_lvalue_addr(ctx, node->left, out);
         ir_printf(ctx, out, "scan [t%d]", addr);
+        if (node->left && strcmp(node->left->type, "id") == 0) {
+            const_unbind(ctx, node->left->value);
+            cse_invalidate_name(ctx, node->left->value);
+        } else if (node->left && node->left->value) {
+            cse_invalidate_name(ctx, node->left->value);
+        }
         return;
     }
     if (strcmp(node->type, "empty") == 0) {
@@ -2151,4 +3751,6 @@ void generate_ir(ASTNode *root, FILE *out)
     ir_printf(&ctx, out, "IR_END");
     free_matrix_info(&ctx);
     free_array_info(&ctx);
+    const_clear(&ctx);
+    cse_clear(&ctx);
 }

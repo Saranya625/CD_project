@@ -1,0 +1,19 @@
+int main() {
+    int a;
+    int b;
+    int x;
+    int y;
+    int z;
+
+    a = 7;
+    b = 3;
+
+    x = a + 0;      // +0
+    y = b * 1;      // *1
+    z = 0 - a;      // 0 - a
+
+    print("x = ", x);
+    print("y = ", y);
+    print("z = ", z);
+    return 0;
+}
