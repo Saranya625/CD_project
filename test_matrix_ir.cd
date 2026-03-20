@@ -1,8 +1,0 @@
-int main(){
-    matrix a[3][3];
-    matrix b[3][3];
-    matrix c[3][3];
-    array d[5];
-    decimal e;
-    e = d.size;
-}

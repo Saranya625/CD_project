@@ -83,6 +83,13 @@
 %type <node> primary_expression
 %type <node> constant
 %type <node> delim_statement
+%type <node> array_initializer
+%type <node> array_init_list_opt
+%type <node> array_init_list
+%type <node> matrix_initializer
+%type <node> matrix_row_list_opt
+%type <node> matrix_row_list
+%type <node> matrix_row
 %type <str> type_specifier
 
 /* ---------- Operator Precedence ---------- */
@@ -143,11 +150,25 @@ global_declaration:
                 createNode("rows", $4, NULL, NULL, NULL),
                 createNode("cols", $7, NULL, NULL, NULL), NULL);
     }
+
+    | KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK
+      OP_ASSIGN matrix_initializer DELIM_SEMI
+    {
+        $$ = createNode("matrix_decl", $2,
+                createNode("rows", $4, NULL, NULL, NULL),
+                createNode("cols", $7, NULL, NULL, NULL), $10);
+    }
     
     | KEYWORD_ARR ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_SEMI
     {
         $$ = createNode("array_decl", $2,
                 createNode("size", $4, NULL, NULL, NULL), NULL, NULL);
+    }
+
+    | KEYWORD_ARR ID DELIM_LBRACK INT_CONST DELIM_RBRACK OP_ASSIGN array_initializer DELIM_SEMI
+    {
+        $$ = createNode("array_decl", $2,
+                createNode("size", $4, NULL, NULL, NULL), NULL, $7);
     }
 
     /*| ID OP_ASSIGN expression DELIM_SEMI*/
@@ -233,6 +254,20 @@ declaration:
     {
         $$ = createNode("array_decl", $2,
                 createNode("size", $4, NULL, NULL, NULL), NULL, NULL);
+    }
+
+    | KEYWORD_MATRIX ID DELIM_LBRACK INT_CONST DELIM_RBRACK DELIM_LBRACK INT_CONST DELIM_RBRACK
+      OP_ASSIGN matrix_initializer DELIM_SEMI
+    {
+        $$ = createNode("matrix_decl", $2,
+                createNode("rows", $4, NULL, NULL, NULL),
+                createNode("cols", $7, NULL, NULL, NULL), $10);
+    }
+
+    | KEYWORD_ARR ID DELIM_LBRACK INT_CONST DELIM_RBRACK OP_ASSIGN array_initializer DELIM_SEMI
+    {
+        $$ = createNode("array_decl", $2,
+                createNode("size", $4, NULL, NULL, NULL), NULL, $7);
     }
     ;
 
@@ -597,6 +632,53 @@ constant:
 
     | STRING_CONST
     { $$ = createNode("string", $1, NULL, NULL, NULL); }
+    ;
+
+array_initializer:
+    DELIM_LBRACE array_init_list_opt DELIM_RBRACE
+    { $$ = $2; }
+    ;
+
+array_init_list_opt:
+    /* empty */
+    { $$ = NULL; }
+
+    | array_init_list
+    { $$ = $1; }
+    ;
+
+array_init_list:
+    expression
+    { $$ = $1; }
+
+    | array_init_list DELIM_COMMA expression
+    { $$ = createNode("init_list", NULL, $1, $3, NULL); }
+    ;
+
+matrix_initializer:
+    DELIM_LBRACE matrix_row_list_opt DELIM_RBRACE
+    { $$ = $2; }
+    ;
+
+matrix_row_list_opt:
+    /* empty */
+    { $$ = NULL; }
+
+    | matrix_row_list
+    { $$ = $1; }
+    ;
+
+matrix_row_list:
+    matrix_row
+    { $$ = $1; }
+
+    | matrix_row_list DELIM_COMMA matrix_row
+    { $$ = createNode("init_rows", NULL, $1, $3, NULL); }
+    ;
+
+matrix_row:
+    DELIM_LBRACE array_init_list_opt DELIM_RBRACE
+    { $$ = createNode("init_row", NULL, $2, NULL, NULL); }
     ;
 
 %%

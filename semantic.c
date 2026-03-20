@@ -304,6 +304,76 @@ static int parse_int_literal(const char *text, long long *value)
     return 1;
 }
 
+static ExprInfo analyze_expression(ASTNode *node, int loop_depth, int switch_depth);
+
+static int count_init_list(ASTNode *node)
+{
+    if (!node) {
+        return 0;
+    }
+    if (node->type && strcmp(node->type, "init_list") == 0) {
+        return count_init_list(node->left) + 1;
+    }
+    return 1;
+}
+
+static int count_row_list(ASTNode *node)
+{
+    if (!node) {
+        return 0;
+    }
+    if (node->type && strcmp(node->type, "init_rows") == 0) {
+        return count_row_list(node->left) + 1;
+    }
+    if (node->type && strcmp(node->type, "init_row") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static void validate_init_list(ASTNode *node, int loop_depth, int switch_depth)
+{
+    if (!node) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_list") == 0) {
+        validate_init_list(node->left, loop_depth, switch_depth);
+        if (node->right) {
+            ExprInfo expr = analyze_expression(node->right, loop_depth, switch_depth);
+            if (expr.type != SYM_INVALID && !is_scalar(expr.type)) {
+                semantic_error("initializer element must be scalar");
+            }
+        }
+        return;
+    }
+    {
+        ExprInfo expr = analyze_expression(node, loop_depth, switch_depth);
+        if (expr.type != SYM_INVALID && !is_scalar(expr.type)) {
+            semantic_error("initializer element must be scalar");
+        }
+    }
+}
+
+static void validate_matrix_init(ASTNode *node, int expected_cols, int loop_depth, int switch_depth)
+{
+    if (!node) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_rows") == 0) {
+        validate_matrix_init(node->left, expected_cols, loop_depth, switch_depth);
+        validate_matrix_init(node->right, expected_cols, loop_depth, switch_depth);
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_row") == 0) {
+        int cols = count_init_list(node->left);
+        if (expected_cols > 0 && cols != expected_cols) {
+            semantic_error("matrix initializer row has %d columns, expected %d", cols, expected_cols);
+        }
+        validate_init_list(node->left, loop_depth, switch_depth);
+        return;
+    }
+}
+
 static int parse_char_literal(const char *text, long long *value)
 {
     if (!text || !value) {
@@ -873,6 +943,14 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
         if (declared_extent <= 0) {
             semantic_error("array '%s' size must be positive", node->value);
         }
+        if (node->third) {
+            int count = count_init_list(node->third);
+            if (declared_extent > 0 && count != declared_extent) {
+                semantic_error("array initializer for '%s' has %d elements, expected %lld",
+                               node->value ? node->value : "<null>", count, declared_extent);
+            }
+            validate_init_list(node->third, loop_depth, switch_depth);
+        }
         return;
     }
 
@@ -891,6 +969,14 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
 
         if (row_count <= 0 || col_count <= 0) {
             semantic_error("matrix '%s' dimensions must be positive", node->value);
+        }
+        if (node->third) {
+            int rows = count_row_list(node->third);
+            if (row_count > 0 && rows != row_count) {
+                semantic_error("matrix initializer for '%s' has %d rows, expected %lld",
+                               node->value ? node->value : "<null>", rows, row_count);
+            }
+            validate_matrix_init(node->third, (int) col_count, loop_depth, switch_depth);
         }
         return;
     }

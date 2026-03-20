@@ -1,0 +1,7 @@
+// tests/test_strength.cd
+int main() {
+  int x;
+  x = 1;
+  x = x * 2; // should simplify; constant propagation should hit
+  print(x);
+}

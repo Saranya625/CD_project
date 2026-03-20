@@ -1,5 +1,6 @@
 #include "ir.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,10 @@ typedef struct {
     struct ArrayInfo *arrays;
     struct ConstBinding *consts;
     struct ExprCache *cse_cache;
+    int capture;
+    char **lines;
+    int line_count;
+    int line_cap;
 } IRContext;
 
 typedef struct MatrixInfo {
@@ -54,16 +59,116 @@ typedef struct ExprCache {
     struct ExprCache *next;
 } ExprCache;
 
+typedef struct {
+    ConstKind kind;
+    long long i;
+    double d;
+    char *s;
+} IRConst;
+
+typedef struct NameInfo {
+    char *name;
+    int has_const;
+    IRConst val;
+    int has_copy;
+    char *copy_name;
+    int has_last_store;
+    int last_store_temp;
+    struct NameInfo *next;
+} NameInfo;
+
+typedef struct {
+    int has_const;
+    IRConst val;
+    int has_copy;
+    int copy_temp;
+    char *name_src;
+} TempInfo;
+
+static void ir_lines_push(IRContext *ctx, char *line)
+{
+    if (!ctx) {
+        free(line);
+        return;
+    }
+    if (ctx->line_count == ctx->line_cap) {
+        int new_cap = ctx->line_cap == 0 ? 128 : ctx->line_cap * 2;
+        char **next = realloc(ctx->lines, (size_t) new_cap * sizeof(char *));
+        if (!next) {
+            free(line);
+            return;
+        }
+        ctx->lines = next;
+        ctx->line_cap = new_cap;
+    }
+    ctx->lines[ctx->line_count++] = line;
+}
+
+static void ir_lines_free(IRContext *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    for (int i = 0; i < ctx->line_count; i++) {
+        free(ctx->lines[i]);
+    }
+    free(ctx->lines);
+    ctx->lines = NULL;
+    ctx->line_count = 0;
+    ctx->line_cap = 0;
+}
+
 static void ir_printf(IRContext *ctx, FILE *out, const char *fmt, ...)
 {
     va_list args;
+    va_list copy;
+    int len = 0;
+    int prefix = 0;
+    char *tmp = NULL;
+    char *buf = NULL;
+
+    if (!ctx) {
+        return;
+    }
+    prefix = ctx->indent * 2;
+    va_start(args, fmt);
+    va_copy(copy, args);
+    len = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (len < 0) {
+        va_end(copy);
+        return;
+    }
+    tmp = malloc((size_t) len + 1);
+    if (!tmp) {
+        va_end(copy);
+        return;
+    }
+    vsnprintf(tmp, (size_t) len + 1, fmt, copy);
+    va_end(copy);
+
+    if (ctx->capture) {
+        if (prefix > 0) {
+            buf = malloc((size_t) prefix + (size_t) len + 1);
+            if (!buf) {
+                free(tmp);
+                return;
+            }
+            memset(buf, ' ', (size_t) prefix);
+            memcpy(buf + prefix, tmp, (size_t) len + 1);
+            free(tmp);
+        } else {
+            buf = tmp;
+        }
+        ir_lines_push(ctx, buf);
+        return;
+    }
     for (int i = 0; i < ctx->indent; i++) {
         fputs("  ", out);
     }
-    va_start(args, fmt);
-    vfprintf(out, fmt, args);
-    va_end(args);
+    fputs(tmp, out);
     fputc('\n', out);
+    free(tmp);
 }
 
 static int new_temp(IRContext *ctx)
@@ -86,6 +191,9 @@ static const char *safe_str(const char *s)
 static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out);
 static int emit_const(IRContext *ctx, const char *kind, const char *value, FILE *out);
 static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label, int continue_label);
+static void emit_matrix_init_list(IRContext *ctx, const char *name, ASTNode *node, int row, int *col, FILE *out);
+static void emit_matrix_init_rows(IRContext *ctx, const char *name, ASTNode *node, int *row, FILE *out);
+static void emit_matrix_init(IRContext *ctx, const char *name, ASTNode *node, FILE *out);
 
 static int parse_int_value(const char *text, int *out)
 {
@@ -3043,12 +3151,102 @@ static void emit_decl_assign(IRContext *ctx, ASTNode *node, FILE *out)
     }
 }
 
+static void emit_array_init_list(IRContext *ctx, const char *name, ASTNode *node, int *index, FILE *out)
+{
+    if (!node || !index) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_list") == 0) {
+        emit_array_init_list(ctx, name, node->left, index, out);
+        if (node->right) {
+            emit_array_init_list(ctx, name, node->right, index, out);
+        }
+        return;
+    }
+    {
+        char buf[32];
+        int idx_temp;
+        int addr;
+        int val;
+        snprintf(buf, sizeof(buf), "%d", *index);
+        idx_temp = emit_const(ctx, "int", buf, out);
+        addr = emit_array_elem_addr(ctx, name, idx_temp, out);
+        val = emit_expr(ctx, node, out);
+        ir_printf(ctx, out, "store [t%d], t%d", addr, val);
+        (*index)++;
+    }
+}
+
+static void emit_matrix_init_rows(IRContext *ctx, const char *name, ASTNode *node, int *row, FILE *out)
+{
+    if (!node || !row) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_rows") == 0) {
+        emit_matrix_init_rows(ctx, name, node->left, row, out);
+        emit_matrix_init_rows(ctx, name, node->right, row, out);
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_row") == 0) {
+        int col = 0;
+        emit_matrix_init_list(ctx, name, node->left, *row, &col, out);
+        (*row)++;
+        return;
+    }
+}
+
+static void emit_matrix_init_list(IRContext *ctx, const char *name, ASTNode *node, int row, int *col, FILE *out)
+{
+    if (!node || !col) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_list") == 0) {
+        emit_matrix_init_list(ctx, name, node->left, row, col, out);
+        if (node->right) {
+            emit_matrix_init_list(ctx, name, node->right, row, col, out);
+        }
+        return;
+    }
+    {
+        char rbuf[32];
+        char cbuf[32];
+        int rtemp;
+        int ctemp;
+        int addr;
+        int val;
+        snprintf(rbuf, sizeof(rbuf), "%d", row);
+        snprintf(cbuf, sizeof(cbuf), "%d", *col);
+        rtemp = emit_const(ctx, "int", rbuf, out);
+        ctemp = emit_const(ctx, "int", cbuf, out);
+        addr = emit_matrix_elem_addr(ctx, name, rtemp, ctemp, out);
+        val = emit_expr(ctx, node, out);
+        ir_printf(ctx, out, "store [t%d], t%d", addr, val);
+        (*col)++;
+    }
+}
+
+static void emit_matrix_init(IRContext *ctx, const char *name, ASTNode *node, FILE *out)
+{
+    int row = 0;
+
+    if (!node) {
+        return;
+    }
+    emit_matrix_init_rows(ctx, name, node, &row, out);
+}
+
 static void emit_array_decl(IRContext *ctx, ASTNode *node, FILE *out)
 {
     if (!node) {
         return;
     }
     ir_printf(ctx, out, "decl_array %s, %s", safe_str(node->value), safe_str(node->left ? node->left->value : NULL));
+    if (node->third && node->value) {
+        int index = 0;
+        emit_array_init_list(ctx, node->value, node->third, &index, out);
+        const_unbind(ctx, node->value);
+        cse_invalidate_name(ctx, node->value);
+    }
 }
 
 static void emit_matrix_decl(IRContext *ctx, ASTNode *node, FILE *out)
@@ -3059,6 +3257,11 @@ static void emit_matrix_decl(IRContext *ctx, ASTNode *node, FILE *out)
     const char *rows = safe_str(node->left ? node->left->value : NULL);
     const char *cols = safe_str(node->right ? node->right->value : NULL);
     ir_printf(ctx, out, "decl_matrix %s, %s, %s", safe_str(node->value), rows, cols);
+    if (node->third && node->value) {
+        emit_matrix_init(ctx, node->value, node->third, out);
+        const_unbind(ctx, node->value);
+        cse_invalidate_name(ctx, node->value);
+    }
 }
 
 static void emit_if_else_chain(IRContext *ctx, ASTNode *node, FILE *out, int break_label, int continue_label)
@@ -3741,16 +3944,1444 @@ static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label,
     emit_expr(ctx, node, out);
 }
 
+static void ir_const_clear(IRConst *val)
+{
+    if (!val) {
+        return;
+    }
+    free(val->s);
+    val->s = NULL;
+    val->kind = CONST_NONE;
+    val->i = 0;
+    val->d = 0.0;
+}
+
+static int ir_const_from_tokens(const char *kind, const char *value, IRConst *out)
+{
+    long long i = 0;
+    double d = 0.0;
+    int ch = 0;
+
+    if (!kind || !value || !out) {
+        return 0;
+    }
+    ir_const_clear(out);
+    if (strcmp(kind, "int") == 0) {
+        int tmp = 0;
+        if (!parse_int_value(value, &tmp)) {
+            return 0;
+        }
+        i = tmp;
+        out->kind = CONST_INT;
+        out->i = i;
+    } else if (strcmp(kind, "decimal") == 0) {
+        if (!parse_double_value(value, &d)) {
+            return 0;
+        }
+        out->kind = CONST_DECIMAL;
+        out->d = d;
+    } else if (strcmp(kind, "char") == 0) {
+        if (!parse_char_value(value, &ch)) {
+            return 0;
+        }
+        out->kind = CONST_CHAR;
+        out->i = ch;
+    } else if (strcmp(kind, "string") == 0) {
+        out->kind = CONST_STRING;
+    } else {
+        return 0;
+    }
+    out->s = strdup(value);
+    return out->s != NULL;
+}
+
+static char *ir_const_to_string(const IRConst *val)
+{
+    if (!val) {
+        return NULL;
+    }
+    if (val->s) {
+        return strdup(val->s);
+    }
+    if (val->kind == CONST_INT) {
+        return str_printf("%lld", val->i);
+    }
+    if (val->kind == CONST_DECIMAL) {
+        return str_printf("%.15g", val->d);
+    }
+    return NULL;
+}
+
+static void name_map_free(NameInfo *head)
+{
+    while (head) {
+        NameInfo *next = head->next;
+        free(head->name);
+        free(head->copy_name);
+        ir_const_clear(&head->val);
+        free(head);
+        head = next;
+    }
+}
+
+static NameInfo *name_map_find(NameInfo *head, const char *name)
+{
+    while (head) {
+        if (strcmp(head->name, name) == 0) {
+            return head;
+        }
+        head = head->next;
+    }
+    return NULL;
+}
+
+static NameInfo *name_map_get(NameInfo **head, const char *name)
+{
+    NameInfo *node;
+
+    if (!head || !name) {
+        return NULL;
+    }
+    node = name_map_find(*head, name);
+    if (node) {
+        return node;
+    }
+    node = calloc(1, sizeof(NameInfo));
+    if (!node) {
+        return NULL;
+    }
+    node->name = strdup(name);
+    node->next = *head;
+    *head = node;
+    return node;
+}
+
+static void name_map_clear(NameInfo **head, const char *name)
+{
+    NameInfo *node;
+
+    if (!head || !name) {
+        return;
+    }
+    node = name_map_find(*head, name);
+    if (!node) {
+        return;
+    }
+    node->has_const = 0;
+    node->has_copy = 0;
+    node->has_last_store = 0;
+    node->last_store_temp = 0;
+    ir_const_clear(&node->val);
+    free(node->copy_name);
+    node->copy_name = NULL;
+}
+
+static void name_map_set_const(NameInfo **head, const char *name, const IRConst *val)
+{
+    NameInfo *node;
+
+    if (!head || !name || !val) {
+        return;
+    }
+    node = name_map_get(head, name);
+    if (!node) {
+        return;
+    }
+    name_map_clear(head, name);
+    node->has_const = 1;
+    node->val.kind = val->kind;
+    node->val.i = val->i;
+    node->val.d = val->d;
+    node->val.s = val->s ? strdup(val->s) : NULL;
+    node->has_last_store = 0;
+    node->last_store_temp = 0;
+}
+
+static void name_map_set_copy(NameInfo **head, const char *name, const char *src)
+{
+    NameInfo *node;
+
+    if (!head || !name || !src) {
+        return;
+    }
+    node = name_map_get(head, name);
+    if (!node) {
+        return;
+    }
+    name_map_clear(head, name);
+    node->has_copy = 1;
+    node->copy_name = strdup(src);
+    node->has_last_store = 0;
+    node->last_store_temp = 0;
+}
+
+static void name_map_set_last_store(NameInfo **head, const char *name, int temp)
+{
+    NameInfo *node;
+
+    if (!head || !name) {
+        return;
+    }
+    node = name_map_get(head, name);
+    if (!node) {
+        return;
+    }
+    node->has_last_store = 1;
+    node->last_store_temp = temp;
+}
+
+static void name_map_clear_all_last_store(NameInfo *head)
+{
+    while (head) {
+        head->has_last_store = 0;
+        head->last_store_temp = 0;
+        head = head->next;
+    }
+}
+
+static void temp_info_clear(TempInfo *info)
+{
+    if (!info) {
+        return;
+    }
+    info->has_const = 0;
+    info->has_copy = 0;
+    info->copy_temp = 0;
+    ir_const_clear(&info->val);
+    free(info->name_src);
+    info->name_src = NULL;
+}
+
+static int parse_label_line(const char *line, int *label)
+{
+    return line && label && sscanf(line, "label L%d", label) == 1;
+}
+
+static int parse_goto_line(const char *line, int *label)
+{
+    return line && label && sscanf(line, "goto L%d", label) == 1;
+}
+
+static int parse_ifz_line(const char *line, int *temp, int *label)
+{
+    return line && temp && label && sscanf(line, "ifz t%d goto L%d", temp, label) == 2;
+}
+
+static int parse_temp_def(const char *line, int *temp)
+{
+    return line && temp && sscanf(line, "t%d =", temp) == 1;
+}
+
+static int parse_const_def(const char *line, int *temp, char *kind, size_t kind_size, char *value, size_t value_size)
+{
+    if (!line || !temp || !kind || !value) {
+        return 0;
+    }
+    return sscanf(line, "t%d = const %31s %127s", temp, kind, value) == 3;
+}
+
+static int parse_mov_def(const char *line, int *temp, int *src)
+{
+    return line && temp && src && sscanf(line, "t%d = mov t%d", temp, src) == 2;
+}
+
+static int parse_addr_def(const char *line, int *temp, char *name, size_t name_size)
+{
+    if (!line || !temp || !name) {
+        return 0;
+    }
+    return sscanf(line, "t%d = addr %127s", temp, name) == 2;
+}
+
+static int parse_load_name(const char *line, int *temp, char *name, size_t name_size)
+{
+    if (!line || !temp || !name) {
+        return 0;
+    }
+    if (sscanf(line, "t%d = load [%*[^]]]", temp) == 1) {
+        return 0;
+    }
+    return sscanf(line, "t%d = load %127s", temp, name) == 2;
+}
+
+static int parse_load_addr(const char *line, int *temp, int *addr)
+{
+    return line && temp && addr && sscanf(line, "t%d = load [t%d]", temp, addr) == 2;
+}
+
+static int parse_store_line(const char *line, int *addr, int *val)
+{
+    return line && addr && val && sscanf(line, "store [t%d], t%d", addr, val) == 2;
+}
+
+static int parse_scan_line(const char *line, int *addr)
+{
+    return line && addr && sscanf(line, "scan [t%d]", addr) == 1;
+}
+
+static int parse_print_line(const char *line, int *temp)
+{
+    return line && temp && sscanf(line, "print t%d", temp) == 1;
+}
+
+static int parse_binary_op(const char *line, int *dst, char *op, size_t op_size, int *lhs, int *rhs)
+{
+    if (!line || !dst || !op || !lhs || !rhs) {
+        return 0;
+    }
+    return sscanf(line, "t%d = %31s t%d, t%d", dst, op, lhs, rhs) == 4;
+}
+
+static int parse_unary_op(const char *line, int *dst, char *op, size_t op_size, int *arg)
+{
+    if (!line || !dst || !op || !arg) {
+        return 0;
+    }
+    return sscanf(line, "t%d = %31s t%d", dst, op, arg) == 3;
+}
+
+static int temp_resolve(TempInfo *temps, int max_temp, int temp)
+{
+    int t = temp;
+    int guard = 0;
+
+    if (!temps || t <= 0 || t > max_temp) {
+        return temp;
+    }
+    while (temps[t].has_copy && guard < max_temp) {
+        t = temps[t].copy_temp;
+        guard++;
+        if (t <= 0 || t > max_temp) {
+            return temp;
+        }
+    }
+    return t;
+}
+
+static int is_identity_op(const char *op, int *is_add, int *is_sub, int *is_mul, int *is_div)
+{
+    if (!op) {
+        return 0;
+    }
+    *is_add = (strcmp(op, "+") == 0 || strcmp(op, "add") == 0);
+    *is_sub = (strcmp(op, "-") == 0 || strcmp(op, "sub") == 0);
+    *is_mul = (strcmp(op, "*") == 0 || strcmp(op, "mul") == 0);
+    *is_div = (strcmp(op, "/") == 0);
+    return *is_add || *is_sub || *is_mul || *is_div;
+}
+
+static int is_foldable_op(const char *op)
+{
+    if (!op) {
+        return 0;
+    }
+    return strcmp(op, "+") == 0 || strcmp(op, "-") == 0 || strcmp(op, "*") == 0 ||
+           strcmp(op, "/") == 0 || strcmp(op, "%") == 0 ||
+           strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 ||
+           strcmp(op, "eq") == 0 || strcmp(op, "ne") == 0 ||
+           strcmp(op, "lt") == 0 || strcmp(op, "gt") == 0 ||
+           strcmp(op, "le") == 0 || strcmp(op, "ge") == 0 ||
+           strcmp(op, "and") == 0 || strcmp(op, "or") == 0;
+}
+
+static int fold_int_binop(const char *op, long long a, long long b, long long *out)
+{
+    if (!op || !out) {
+        return 0;
+    }
+    if (strcmp(op, "+") == 0 || strcmp(op, "add") == 0) {
+        *out = a + b;
+        return 1;
+    }
+    if (strcmp(op, "-") == 0 || strcmp(op, "sub") == 0) {
+        *out = a - b;
+        return 1;
+    }
+    if (strcmp(op, "*") == 0 || strcmp(op, "mul") == 0) {
+        *out = a * b;
+        return 1;
+    }
+    if (strcmp(op, "/") == 0) {
+        if (b == 0) {
+            return 0;
+        }
+        *out = a / b;
+        return 1;
+    }
+    if (strcmp(op, "%") == 0) {
+        if (b == 0) {
+            return 0;
+        }
+        *out = a % b;
+        return 1;
+    }
+    if (strcmp(op, "eq") == 0) {
+        *out = (a == b);
+        return 1;
+    }
+    if (strcmp(op, "ne") == 0) {
+        *out = (a != b);
+        return 1;
+    }
+    if (strcmp(op, "lt") == 0) {
+        *out = (a < b);
+        return 1;
+    }
+    if (strcmp(op, "gt") == 0) {
+        *out = (a > b);
+        return 1;
+    }
+    if (strcmp(op, "le") == 0) {
+        *out = (a <= b);
+        return 1;
+    }
+    if (strcmp(op, "ge") == 0) {
+        *out = (a >= b);
+        return 1;
+    }
+    if (strcmp(op, "and") == 0) {
+        *out = (a != 0 && b != 0);
+        return 1;
+    }
+    if (strcmp(op, "or") == 0) {
+        *out = (a != 0 || b != 0);
+        return 1;
+    }
+    return 0;
+}
+
+static int build_label_index(char **lines, int line_count, int **out_labels, int **out_indices, int *out_count)
+{
+    int *labels = NULL;
+    int *indices = NULL;
+    int count = 0;
+    int cap = 0;
+
+    if (!lines || !out_labels || !out_indices || !out_count) {
+        return 0;
+    }
+    for (int i = 0; i < line_count; i++) {
+        int label = 0;
+        if (parse_label_line(lines[i], &label)) {
+            if (count == cap) {
+                int new_cap = cap == 0 ? 64 : cap * 2;
+                int *new_labels = realloc(labels, (size_t) new_cap * sizeof(int));
+                int *new_indices = realloc(indices, (size_t) new_cap * sizeof(int));
+                if (!new_labels || !new_indices) {
+                    free(new_labels);
+                    free(new_indices);
+                    free(labels);
+                    free(indices);
+                    return 0;
+                }
+                labels = new_labels;
+                indices = new_indices;
+                cap = new_cap;
+            }
+            labels[count] = label;
+            indices[count] = i;
+            count++;
+        }
+    }
+    *out_labels = labels;
+    *out_indices = indices;
+    *out_count = count;
+    return 1;
+}
+
+static int label_index_find(int *labels, int *indices, int count, int label)
+{
+    for (int i = 0; i < count; i++) {
+        if (labels[i] == label) {
+            return indices[i];
+        }
+    }
+    return -1;
+}
+
+static void apply_jump_threading(IRContext *ctx)
+{
+    int *labels = NULL;
+    int *indices = NULL;
+    int label_count = 0;
+
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    if (!build_label_index(ctx->lines, ctx->line_count, &labels, &indices, &label_count)) {
+        return;
+    }
+    for (int i = 0; i < ctx->line_count; i++) {
+        int label = 0;
+        if (!parse_goto_line(ctx->lines[i], &label)) {
+            continue;
+        }
+        int next_label = label;
+        int guard = 0;
+        while (guard < label_count) {
+            int idx = label_index_find(labels, indices, label_count, next_label);
+            if (idx < 0 || idx + 1 >= ctx->line_count) {
+                break;
+            }
+            {
+                int forwarded = 0;
+                if (parse_goto_line(ctx->lines[idx + 1], &forwarded)) {
+                    next_label = forwarded;
+                    guard++;
+                    continue;
+                }
+            }
+            break;
+        }
+        if (next_label != label) {
+            char *new_line = str_printf("goto L%d", next_label);
+            if (new_line) {
+                free(ctx->lines[i]);
+                ctx->lines[i] = new_line;
+            }
+        }
+    }
+    free(labels);
+    free(indices);
+}
+
+static void apply_jump_simplify(IRContext *ctx)
+{
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    for (int i = 0; i + 1 < ctx->line_count; i++) {
+        int label = 0;
+        if (!parse_goto_line(ctx->lines[i], &label)) {
+            continue;
+        }
+        {
+            int next_label = 0;
+            if (parse_label_line(ctx->lines[i + 1], &next_label) && next_label == label) {
+                free(ctx->lines[i]);
+                ctx->lines[i] = NULL;
+            }
+        }
+    }
+    {
+        int out = 0;
+        for (int i = 0; i < ctx->line_count; i++) {
+            if (ctx->lines[i]) {
+                ctx->lines[out++] = ctx->lines[i];
+            }
+        }
+        ctx->line_count = out;
+    }
+}
+
+static void apply_unreachable_elim(IRContext *ctx)
+{
+    int skip = 0;
+
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    for (int i = 0; i < ctx->line_count; i++) {
+        int label = 0;
+        if (parse_label_line(ctx->lines[i], &label)) {
+            skip = 0;
+            continue;
+        }
+        if (skip) {
+            if (strcmp(ctx->lines[i], "IR_BEGIN") == 0 || strcmp(ctx->lines[i], "IR_END") == 0) {
+                skip = 0;
+            } else {
+                free(ctx->lines[i]);
+                ctx->lines[i] = NULL;
+            }
+            continue;
+        }
+        if (parse_goto_line(ctx->lines[i], &label)) {
+            skip = 1;
+        }
+    }
+    {
+        int out = 0;
+        for (int i = 0; i < ctx->line_count; i++) {
+            if (ctx->lines[i]) {
+                ctx->lines[out++] = ctx->lines[i];
+            }
+        }
+        ctx->line_count = out;
+    }
+}
+
+static int find_max_temp(char **lines, int line_count)
+{
+    int max_temp = 0;
+    for (int i = 0; i < line_count; i++) {
+        int t = 0;
+        const char *line = lines[i];
+        while (line && *line) {
+            if (*line == 't' && isdigit((unsigned char) line[1])) {
+                int val = 0;
+                int j = 1;
+                while (line[j] && isdigit((unsigned char) line[j])) {
+                    val = val * 10 + (line[j] - '0');
+                    j++;
+                }
+                if (val > max_temp) {
+                    max_temp = val;
+                }
+                line += j;
+                continue;
+            }
+            line++;
+        }
+    }
+    return max_temp;
+}
+
+static char **build_addr_name_map(char **lines, int line_count, int max_temp)
+{
+    char **map = calloc((size_t) max_temp + 1, sizeof(char *));
+    if (!map) {
+        return NULL;
+    }
+    for (int i = 0; i < line_count; i++) {
+        int temp = 0;
+        char name[128];
+        if (parse_addr_def(lines[i], &temp, name, sizeof(name))) {
+            if (temp > 0 && temp <= max_temp && !map[temp]) {
+                map[temp] = strdup(name);
+            }
+        }
+    }
+    return map;
+}
+
+static void free_addr_name_map(char **map, int max_temp)
+{
+    if (!map) {
+        return;
+    }
+    for (int i = 0; i <= max_temp; i++) {
+        free(map[i]);
+    }
+    free(map);
+}
+
+static void apply_propagation(IRContext *ctx)
+{
+    int max_temp = 0;
+    TempInfo *temps = NULL;
+    NameInfo *names = NULL;
+    char **addr_map = NULL;
+    char **const_key = NULL;
+    int *const_temp = NULL;
+    int const_count = 0;
+    int const_cap = 0;
+
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    max_temp = find_max_temp(ctx->lines, ctx->line_count);
+    if (max_temp <= 0) {
+        return;
+    }
+    temps = calloc((size_t) max_temp + 1, sizeof(TempInfo));
+    if (!temps) {
+        return;
+    }
+    addr_map = build_addr_name_map(ctx->lines, ctx->line_count, max_temp);
+    for (int i = 0; i < ctx->line_count; i++) {
+        int label = 0;
+        int def = 0;
+        int src = 0;
+        int addr = 0;
+        int val = 0;
+        int lhs = 0;
+        int rhs = 0;
+        int arg = 0;
+        char kind[32];
+        char value[128];
+        char op[32];
+        char name[128];
+
+        if (parse_label_line(ctx->lines[i], &label)) {
+            for (int t = 0; t <= max_temp; t++) {
+                temp_info_clear(&temps[t]);
+            }
+            name_map_free(names);
+            names = NULL;
+            for (int c = 0; c < const_count; c++) {
+                free(const_key[c]);
+            }
+            const_count = 0;
+            continue;
+        }
+
+        if (parse_const_def(ctx->lines[i], &def, kind, sizeof(kind), value, sizeof(value))) {
+            char *key = str_printf("%s:%s", kind, value);
+            int reused = 0;
+            if (key) {
+                for (int c = 0; c < const_count; c++) {
+                    if (strcmp(const_key[c], key) == 0) {
+                        int src_temp = const_temp[c];
+                        if (src_temp > 0 && src_temp <= max_temp) {
+                            char *new_line = str_printf("t%d = mov t%d", def, src_temp);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temp_info_clear(&temps[def]);
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = src_temp;
+                            reused = 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!reused && key) {
+                if (const_count == const_cap) {
+                    int new_cap = const_cap == 0 ? 16 : const_cap * 2;
+                    char **new_keys = realloc(const_key, (size_t) new_cap * sizeof(char *));
+                    int *new_temps = realloc(const_temp, (size_t) new_cap * sizeof(int));
+                    if (!new_keys || !new_temps) {
+                        free(new_keys);
+                        free(new_temps);
+                        free(key);
+                        key = NULL;
+                    } else {
+                        const_key = new_keys;
+                        const_temp = new_temps;
+                        const_cap = new_cap;
+                    }
+                }
+                if (key) {
+                    const_key[const_count] = key;
+                    const_temp[const_count] = def;
+                    const_count++;
+                }
+            }
+            if (reused) {
+                continue;
+            }
+            temp_info_clear(&temps[def]);
+            if (ir_const_from_tokens(kind, value, &temps[def].val)) {
+                temps[def].has_const = 1;
+            }
+            continue;
+        }
+
+        if (parse_mov_def(ctx->lines[i], &def, &src)) {
+            int src_res = temp_resolve(temps, max_temp, src);
+            temp_info_clear(&temps[def]);
+            if (src_res > 0 && src_res <= max_temp && temps[src_res].has_const) {
+                char *val_str = ir_const_to_string(&temps[src_res].val);
+                if (val_str) {
+                    const char *kind_str = temps[src_res].val.kind == CONST_INT ? "int" :
+                                           temps[src_res].val.kind == CONST_DECIMAL ? "decimal" :
+                                           temps[src_res].val.kind == CONST_CHAR ? "char" : "string";
+                    char *new_line = str_printf("t%d = const %s %s", def, kind_str, val_str);
+                    free(val_str);
+                    if (new_line) {
+                        free(ctx->lines[i]);
+                        ctx->lines[i] = new_line;
+                        temps[def].has_const = 1;
+                        temps[def].val.kind = temps[src_res].val.kind;
+                        temps[def].val.i = temps[src_res].val.i;
+                        temps[def].val.d = temps[src_res].val.d;
+                        temps[def].val.s = temps[src_res].val.s ? strdup(temps[src_res].val.s) : NULL;
+                    }
+                }
+            } else {
+                temps[def].has_copy = 1;
+                temps[def].copy_temp = src_res;
+                if (src_res != src) {
+                    char *new_line = str_printf("t%d = mov t%d", def, src_res);
+                    if (new_line) {
+                        free(ctx->lines[i]);
+                        ctx->lines[i] = new_line;
+                    }
+                }
+                if (src_res > 0 && src_res <= max_temp && temps[src_res].name_src) {
+                    temps[def].name_src = strdup(temps[src_res].name_src);
+                }
+            }
+            continue;
+        }
+
+        if (parse_addr_def(ctx->lines[i], &def, name, sizeof(name))) {
+            temp_info_clear(&temps[def]);
+            continue;
+        }
+
+        if (parse_load_name(ctx->lines[i], &def, name, sizeof(name))) {
+            NameInfo *info = name_map_find(names, name);
+            temp_info_clear(&temps[def]);
+            if (info && info->has_const) {
+                char *val_str = ir_const_to_string(&info->val);
+                if (val_str) {
+                    const char *kind_str = info->val.kind == CONST_INT ? "int" :
+                                           info->val.kind == CONST_DECIMAL ? "decimal" :
+                                           info->val.kind == CONST_CHAR ? "char" : "string";
+                    char *new_line = str_printf("t%d = const %s %s", def, kind_str, val_str);
+                    free(val_str);
+                    if (new_line) {
+                        free(ctx->lines[i]);
+                        ctx->lines[i] = new_line;
+                        temps[def].has_const = 1;
+                        temps[def].val.kind = info->val.kind;
+                        temps[def].val.i = info->val.i;
+                        temps[def].val.d = info->val.d;
+                        temps[def].val.s = info->val.s ? strdup(info->val.s) : NULL;
+                    }
+                }
+            } else if (info && info->has_last_store) {
+                int src_temp = temp_resolve(temps, max_temp, info->last_store_temp);
+                if (src_temp > 0 && src_temp <= max_temp) {
+                    char *new_line = str_printf("t%d = mov t%d", def, src_temp);
+                    if (new_line) {
+                        free(ctx->lines[i]);
+                        ctx->lines[i] = new_line;
+                    }
+                    temps[def].has_copy = 1;
+                    temps[def].copy_temp = src_temp;
+                }
+            } else if (info && info->has_copy && info->copy_name) {
+                char *new_line = str_printf("t%d = load %s", def, info->copy_name);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+                temps[def].name_src = strdup(info->copy_name);
+            } else {
+                temps[def].name_src = strdup(name);
+            }
+            continue;
+        }
+
+        if (parse_load_addr(ctx->lines[i], &def, &addr)) {
+            int addr_res = temp_resolve(temps, max_temp, addr);
+            temp_info_clear(&temps[def]);
+            if (addr_res != addr) {
+                char *new_line = str_printf("t%d = load [t%d]", def, addr_res);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            name_map_clear_all_last_store(names);
+            continue;
+        }
+
+        if (parse_store_line(ctx->lines[i], &addr, &val)) {
+            int addr_res = temp_resolve(temps, max_temp, addr);
+            int val_res = temp_resolve(temps, max_temp, val);
+            if (addr_res != addr || val_res != val) {
+                char *new_line = str_printf("store [t%d], t%d", addr_res, val_res);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            if (addr_res > 0 && addr_res <= max_temp && addr_map && addr_map[addr_res]) {
+                const char *var = addr_map[addr_res];
+                NameInfo *info = name_map_find(names, var);
+                if (info && info->has_last_store && info->last_store_temp == val_res) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = NULL;
+                    continue;
+                }
+                name_map_clear(&names, var);
+                if (val_res > 0 && val_res <= max_temp) {
+                    if (temps[val_res].has_const) {
+                        name_map_set_const(&names, var, &temps[val_res].val);
+                    } else if (temps[val_res].name_src) {
+                        name_map_set_copy(&names, var, temps[val_res].name_src);
+                    }
+                }
+                name_map_set_last_store(&names, var, val_res);
+            } else {
+                name_map_clear_all_last_store(names);
+            }
+            continue;
+        }
+
+        if (parse_scan_line(ctx->lines[i], &addr)) {
+            int addr_res = temp_resolve(temps, max_temp, addr);
+            if (addr_res != addr) {
+                char *new_line = str_printf("scan [t%d]", addr_res);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            if (addr_res > 0 && addr_res <= max_temp && addr_map && addr_map[addr_res]) {
+                name_map_clear(&names, addr_map[addr_res]);
+            } else {
+                name_map_clear_all_last_store(names);
+            }
+            continue;
+        }
+
+        if (parse_ifz_line(ctx->lines[i], &arg, &label)) {
+            int arg_res = temp_resolve(temps, max_temp, arg);
+            if (arg_res != arg) {
+                char *new_line = str_printf("ifz t%d goto L%d", arg_res, label);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            continue;
+        }
+
+        if (parse_print_line(ctx->lines[i], &arg)) {
+            int arg_res = temp_resolve(temps, max_temp, arg);
+            if (arg_res != arg) {
+                char *new_line = str_printf("print t%d", arg_res);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            continue;
+        }
+
+        if (parse_binary_op(ctx->lines[i], &def, op, sizeof(op), &lhs, &rhs)) {
+            int lhs_res = temp_resolve(temps, max_temp, lhs);
+            int rhs_res = temp_resolve(temps, max_temp, rhs);
+            int is_add = 0, is_sub = 0, is_mul = 0, is_div = 0;
+            temp_info_clear(&temps[def]);
+            if (strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0) {
+                name_map_clear_all_last_store(names);
+            }
+
+            if (is_foldable_op(op) &&
+                lhs_res > 0 && lhs_res <= max_temp && rhs_res > 0 && rhs_res <= max_temp &&
+                temps[lhs_res].has_const && temps[rhs_res].has_const &&
+                temps[lhs_res].val.kind == CONST_INT && temps[rhs_res].val.kind == CONST_INT) {
+                long long folded = 0;
+                if (fold_int_binop(op, temps[lhs_res].val.i, temps[rhs_res].val.i, &folded)) {
+                    char *new_line = str_printf("t%d = const int %lld", def, folded);
+                    if (new_line) {
+                        free(ctx->lines[i]);
+                        ctx->lines[i] = new_line;
+                        temps[def].has_const = 1;
+                        temps[def].val.kind = CONST_INT;
+                        temps[def].val.i = folded;
+                        temps[def].val.s = str_printf("%lld", folded);
+                    }
+                    continue;
+                }
+            }
+
+            if (lhs_res > 0 && lhs_res <= max_temp && rhs_res > 0 && rhs_res <= max_temp) {
+                is_identity_op(op, &is_add, &is_sub, &is_mul, &is_div);
+                if (is_add || is_sub || is_mul || is_div) {
+                    int lhs_const = temps[lhs_res].has_const && temps[lhs_res].val.kind == CONST_INT;
+                    int rhs_const = temps[rhs_res].has_const && temps[rhs_res].val.kind == CONST_INT;
+                    long long lhs_val = lhs_const ? temps[lhs_res].val.i : 0;
+                    long long rhs_val = rhs_const ? temps[rhs_res].val.i : 0;
+                    if (is_add) {
+                        if (rhs_const && rhs_val == 0) {
+                            char *new_line = str_printf("t%d = mov t%d", def, lhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = lhs_res;
+                            continue;
+                        }
+                        if (lhs_const && lhs_val == 0) {
+                            char *new_line = str_printf("t%d = mov t%d", def, rhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = rhs_res;
+                            continue;
+                        }
+                    }
+                    if (is_sub) {
+                        if (rhs_const && rhs_val == 0) {
+                            char *new_line = str_printf("t%d = mov t%d", def, lhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = lhs_res;
+                            continue;
+                        }
+                        if (lhs_const && lhs_val == 0) {
+                            char *new_line = str_printf("t%d = uminus t%d", def, rhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            continue;
+                        }
+                    }
+                    if (is_mul) {
+                        if ((lhs_const && lhs_val == 0) || (rhs_const && rhs_val == 0)) {
+                            char *new_line = str_printf("t%d = const int 0", def);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                                temps[def].has_const = 1;
+                                temps[def].val.kind = CONST_INT;
+                                temps[def].val.i = 0;
+                                temps[def].val.s = strdup("0");
+                            }
+                            continue;
+                        }
+                        if (lhs_const && lhs_val == 1) {
+                            char *new_line = str_printf("t%d = mov t%d", def, rhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = rhs_res;
+                            continue;
+                        }
+                        if (rhs_const && rhs_val == 1) {
+                            char *new_line = str_printf("t%d = mov t%d", def, lhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = lhs_res;
+                            continue;
+                        }
+                        if (lhs_const && lhs_val == -1) {
+                            char *new_line = str_printf("t%d = uminus t%d", def, rhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            continue;
+                        }
+                        if (rhs_const && rhs_val == -1) {
+                            char *new_line = str_printf("t%d = uminus t%d", def, lhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            continue;
+                        }
+                    }
+                    if (is_div) {
+                        if (rhs_const && rhs_val == 1) {
+                            char *new_line = str_printf("t%d = mov t%d", def, lhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            temps[def].has_copy = 1;
+                            temps[def].copy_temp = lhs_res;
+                            continue;
+                        }
+                        if (rhs_const && rhs_val == -1) {
+                            char *new_line = str_printf("t%d = uminus t%d", def, lhs_res);
+                            if (new_line) {
+                                free(ctx->lines[i]);
+                                ctx->lines[i] = new_line;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if (lhs_res != lhs || rhs_res != rhs) {
+                char *new_line = str_printf("t%d = %s t%d, t%d", def, op, lhs_res, rhs_res);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            continue;
+        }
+
+        if (parse_unary_op(ctx->lines[i], &def, op, sizeof(op), &arg)) {
+            int arg_res = temp_resolve(temps, max_temp, arg);
+            temp_info_clear(&temps[def]);
+            if (strcmp(op, "addr") == 0) {
+                name_map_clear_all_last_store(names);
+            }
+            if ((strcmp(op, "uminus") == 0 || strcmp(op, "not") == 0) &&
+                arg_res > 0 && arg_res <= max_temp &&
+                temps[arg_res].has_const && temps[arg_res].val.kind == CONST_INT) {
+                long long folded = 0;
+                if (strcmp(op, "uminus") == 0) {
+                    folded = -temps[arg_res].val.i;
+                } else {
+                    folded = temps[arg_res].val.i == 0 ? 1 : 0;
+                }
+                {
+                    char *new_line = str_printf("t%d = const int %lld", def, folded);
+                    if (new_line) {
+                        free(ctx->lines[i]);
+                        ctx->lines[i] = new_line;
+                        temps[def].has_const = 1;
+                        temps[def].val.kind = CONST_INT;
+                        temps[def].val.i = folded;
+                        temps[def].val.s = str_printf("%lld", folded);
+                    }
+                }
+            } else if (arg_res != arg) {
+                char *new_line = str_printf("t%d = %s t%d", def, op, arg_res);
+                if (new_line) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = new_line;
+                }
+            }
+            continue;
+        }
+    }
+
+    for (int t = 0; t <= max_temp; t++) {
+        temp_info_clear(&temps[t]);
+    }
+    for (int c = 0; c < const_count; c++) {
+        free(const_key[c]);
+    }
+    free(const_key);
+    free(const_temp);
+    free(temps);
+    name_map_free(names);
+    free_addr_name_map(addr_map, max_temp);
+}
+
+static int name_is_in_set(const char *name, char **set, int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (strcmp(set[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void apply_dead_named_elim(IRContext *ctx)
+{
+    char **addr_map = NULL;
+    int max_temp = 0;
+    char **scalar_names = NULL;
+    int scalar_count = 0;
+    int scalar_cap = 0;
+    char **array_names = NULL;
+    int array_count = 0;
+    int array_cap = 0;
+    char **matrix_names = NULL;
+    int matrix_count = 0;
+    int matrix_cap = 0;
+    char **live = NULL;
+    int live_count = 0;
+    int live_cap = 0;
+
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    max_temp = find_max_temp(ctx->lines, ctx->line_count);
+    addr_map = build_addr_name_map(ctx->lines, ctx->line_count, max_temp);
+
+    for (int i = 0; i < ctx->line_count; i++) {
+        char name[128];
+        if (sscanf(ctx->lines[i], "decl %*s %127s", name) == 1) {
+            if (scalar_count == scalar_cap) {
+                int new_cap = scalar_cap == 0 ? 32 : scalar_cap * 2;
+                char **next = realloc(scalar_names, (size_t) new_cap * sizeof(char *));
+                if (!next) {
+                    continue;
+                }
+                scalar_names = next;
+                scalar_cap = new_cap;
+            }
+            scalar_names[scalar_count++] = strdup(name);
+            continue;
+        }
+        if (sscanf(ctx->lines[i], "decl_array %127[^,],", name) == 1) {
+            if (array_count == array_cap) {
+                int new_cap = array_cap == 0 ? 32 : array_cap * 2;
+                char **next = realloc(array_names, (size_t) new_cap * sizeof(char *));
+                if (!next) {
+                    continue;
+                }
+                array_names = next;
+                array_cap = new_cap;
+            }
+            array_names[array_count++] = strdup(name);
+            continue;
+        }
+        if (sscanf(ctx->lines[i], "decl_matrix %127[^,],", name) == 1) {
+            if (matrix_count == matrix_cap) {
+                int new_cap = matrix_cap == 0 ? 32 : matrix_cap * 2;
+                char **next = realloc(matrix_names, (size_t) new_cap * sizeof(char *));
+                if (!next) {
+                    continue;
+                }
+                matrix_names = next;
+                matrix_cap = new_cap;
+            }
+            matrix_names[matrix_count++] = strdup(name);
+            continue;
+        }
+    }
+
+    for (int i = ctx->line_count - 1; i >= 0; i--) {
+        int temp = 0;
+        int addr = 0;
+        int val = 0;
+        char name[128];
+
+        if (parse_load_name(ctx->lines[i], &temp, name, sizeof(name))) {
+            if (!name_is_in_set(name, live, live_count)) {
+                if (live_count == live_cap) {
+                    int new_cap = live_cap == 0 ? 32 : live_cap * 2;
+                    char **next = realloc(live, (size_t) new_cap * sizeof(char *));
+                    if (!next) {
+                        continue;
+                    }
+                    live = next;
+                    live_cap = new_cap;
+                }
+                live[live_count++] = strdup(name);
+            }
+            continue;
+        }
+        if (parse_store_line(ctx->lines[i], &addr, &val)) {
+            const char *var = NULL;
+            if (addr_map && addr > 0 && addr <= max_temp) {
+                var = addr_map[addr];
+            }
+            if (var && name_is_in_set(var, scalar_names, scalar_count) &&
+                !name_is_in_set(var, array_names, array_count) &&
+                !name_is_in_set(var, matrix_names, matrix_count)) {
+                if (!name_is_in_set(var, live, live_count)) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = NULL;
+                } else {
+                    for (int j = 0; j < live_count; j++) {
+                        if (strcmp(live[j], var) == 0) {
+                            free(live[j]);
+                            live[j] = live[live_count - 1];
+                            live_count--;
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (parse_scan_line(ctx->lines[i], &addr)) {
+            const char *var = NULL;
+            if (addr_map && addr > 0 && addr <= max_temp) {
+                var = addr_map[addr];
+            }
+            if (var && name_is_in_set(var, scalar_names, scalar_count) &&
+                !name_is_in_set(var, array_names, array_count) &&
+                !name_is_in_set(var, matrix_names, matrix_count)) {
+                for (int j = 0; j < live_count; j++) {
+                    if (strcmp(live[j], var) == 0) {
+                        free(live[j]);
+                        live[j] = live[live_count - 1];
+                        live_count--;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+    }
+
+    {
+        int out = 0;
+        for (int i = 0; i < ctx->line_count; i++) {
+            if (ctx->lines[i]) {
+                ctx->lines[out++] = ctx->lines[i];
+            }
+        }
+        ctx->line_count = out;
+    }
+
+    for (int i = 0; i < scalar_count; i++) {
+        free(scalar_names[i]);
+    }
+    for (int i = 0; i < array_count; i++) {
+        free(array_names[i]);
+    }
+    for (int i = 0; i < matrix_count; i++) {
+        free(matrix_names[i]);
+    }
+    for (int i = 0; i < live_count; i++) {
+        free(live[i]);
+    }
+    free(scalar_names);
+    free(array_names);
+    free(matrix_names);
+    free(live);
+    free_addr_name_map(addr_map, max_temp);
+}
+
+static void apply_dead_temp_elim(IRContext *ctx)
+{
+    int max_temp = 0;
+    int *use_counts = NULL;
+    int *def_line = NULL;
+    int *queue = NULL;
+    int queue_count = 0;
+
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    max_temp = find_max_temp(ctx->lines, ctx->line_count);
+    if (max_temp <= 0) {
+        return;
+    }
+    use_counts = calloc((size_t) max_temp + 1, sizeof(int));
+    def_line = calloc((size_t) max_temp + 1, sizeof(int));
+    queue = calloc((size_t) max_temp + 1, sizeof(int));
+    if (!use_counts || !def_line || !queue) {
+        free(use_counts);
+        free(def_line);
+        free(queue);
+        return;
+    }
+    for (int i = 0; i <= max_temp; i++) {
+        def_line[i] = -1;
+    }
+
+    for (int i = 0; i < ctx->line_count; i++) {
+        int def = 0;
+        if (parse_temp_def(ctx->lines[i], &def)) {
+            def_line[def] = i;
+        }
+        {
+            const char *line = ctx->lines[i];
+            int pos = 0;
+            int skip_def = 0;
+            if (parse_temp_def(line, &def) && line[0] == 't') {
+                skip_def = 1;
+            }
+            while (line && line[pos]) {
+                if (line[pos] == 't' && isdigit((unsigned char) line[pos + 1])) {
+                    int val = 0;
+                    int j = pos + 1;
+                    while (line[j] && isdigit((unsigned char) line[j])) {
+                        val = val * 10 + (line[j] - '0');
+                        j++;
+                    }
+                    if (!(skip_def && pos == 0)) {
+                        if (val > 0 && val <= max_temp) {
+                            use_counts[val]++;
+                        }
+                    }
+                    pos = j;
+                    continue;
+                }
+                pos++;
+            }
+        }
+    }
+
+    for (int t = 1; t <= max_temp; t++) {
+        if (use_counts[t] == 0 && def_line[t] >= 0) {
+            queue[queue_count++] = t;
+        }
+    }
+
+    while (queue_count > 0) {
+        int t = queue[--queue_count];
+        int line_idx = def_line[t];
+        if (line_idx < 0 || !ctx->lines[line_idx]) {
+            continue;
+        }
+        {
+            const char *line = ctx->lines[line_idx];
+            int def = 0;
+            if (!parse_temp_def(line, &def)) {
+                continue;
+            }
+            {
+                const char *p = line;
+                int pos = 0;
+                while (p && p[pos]) {
+                    if (p[pos] == 't' && isdigit((unsigned char) p[pos + 1])) {
+                        int val = 0;
+                        int j = pos + 1;
+                        while (p[j] && isdigit((unsigned char) p[j])) {
+                            val = val * 10 + (p[j] - '0');
+                            j++;
+                        }
+                        if (pos != 0) {
+                            if (val > 0 && val <= max_temp) {
+                                use_counts[val]--;
+                                if (use_counts[val] == 0 && def_line[val] >= 0) {
+                                    queue[queue_count++] = val;
+                                }
+                            }
+                        }
+                        pos = j;
+                        continue;
+                    }
+                    pos++;
+                }
+            }
+        }
+        free(ctx->lines[line_idx]);
+        ctx->lines[line_idx] = NULL;
+    }
+
+    {
+        int out = 0;
+        for (int i = 0; i < ctx->line_count; i++) {
+            if (ctx->lines[i]) {
+                ctx->lines[out++] = ctx->lines[i];
+            }
+        }
+        ctx->line_count = out;
+    }
+
+    free(use_counts);
+    free(def_line);
+    free(queue);
+}
+
+static void optimize_ir(IRContext *ctx)
+{
+    if (!ctx || !ctx->lines) {
+        return;
+    }
+    apply_jump_threading(ctx);
+    apply_jump_simplify(ctx);
+    apply_unreachable_elim(ctx);
+    apply_propagation(ctx);
+}
+
 void generate_ir(ASTNode *root, FILE *out)
 {
     IRContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     collect_matrix_decls(&ctx, root);
+    ctx.capture = 1;
     ir_printf(&ctx, out, "IR_BEGIN");
     emit_stmt(&ctx, root, out, -1, -1);
     ir_printf(&ctx, out, "IR_END");
+    optimize_ir(&ctx);
+    ctx.capture = 0;
+    for (int i = 0; i < ctx.line_count; i++) {
+        if (ctx.lines[i]) {
+            fputs(ctx.lines[i], out);
+            fputc('\n', out);
+        }
+    }
     free_matrix_info(&ctx);
     free_array_info(&ctx);
     const_clear(&ctx);
     cse_clear(&ctx);
+    ir_lines_free(&ctx);
 }

@@ -1,0 +1,7 @@
+int main(){
+    matrix a[3][3] = {{1,2,9},{3,4,10},{11,12,13}};
+    matrix b[2][2] = {{5,6},{7,8}};
+    matrix c[2][2];
+    array d[5];
+    decimal e;
+}
