@@ -9,6 +9,7 @@
     #include "ast.h"
     #include "semantic.h"
     #include "ir.h"
+    #include "riscv.h"  
 
     extern int line_no;
     extern int yylex();
@@ -743,6 +744,14 @@ int main() {
             generate_ir(root, ir_out);
             generate_ir(root, stdout);
             fclose(ir_out);
+
+            printf("Generating RISC-V assembly...\n");
+            if (generate_riscv("output.ir", "output.s") == 0) {
+                printf("RISC-V assembly written to output.s\n");
+            } else {
+                fprintf(stderr, "RISC-V code generation failed.\n");
+            }
+
         } else {
             printf("Semantic analysis failed with %d error(s).\n", semantic_error_count());
         }
