@@ -2441,17 +2441,23 @@ static int emit_matrix_det(IRContext *ctx, const char *src, int n, FILE *out)
 static void emit_safe_div(IRContext *ctx, int dst, int num, int den, FILE *out)
 {
     int zero = new_temp(ctx);
+    int one = new_temp(ctx);
+    int num_f = new_temp(ctx);
+    int den_f = new_temp(ctx);
     int is_zero = new_temp(ctx);
     int nonzero_label = new_label(ctx);
     int end_label = new_label(ctx);
 
-    ir_printf(ctx, out, "t%d = const int 0", zero);
-    ir_printf(ctx, out, "t%d = eq t%d, t%d", is_zero, den, zero);
+    ir_printf(ctx, out, "t%d = const decimal 0.0", zero);
+    ir_printf(ctx, out, "t%d = const decimal 1.0", one);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", num_f, num, one);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", den_f, den, one);
+    ir_printf(ctx, out, "t%d = eq t%d, t%d", is_zero, den_f, zero);
     ir_printf(ctx, out, "ifz t%d goto L%d", is_zero, nonzero_label);
-    ir_printf(ctx, out, "t%d = const int 0", dst);
+    ir_printf(ctx, out, "t%d = const decimal 0.0", dst);
     ir_printf(ctx, out, "goto L%d", end_label);
     ir_printf(ctx, out, "label L%d", nonzero_label);
-    ir_printf(ctx, out, "t%d = / t%d, t%d", dst, num, den);
+    ir_printf(ctx, out, "t%d = / t%d, t%d", dst, num_f, den_f);
     ir_printf(ctx, out, "label L%d", end_label);
 }
 
@@ -2468,6 +2474,7 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
     int r_addr;
     int zero;
     int one;
+    int one_dec;
     int n_const;
     int i_label;
     int i_end_label;
@@ -2510,9 +2517,11 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
 
     zero = new_temp(ctx);
     one = new_temp(ctx);
+    one_dec = new_temp(ctx);
     n_const = new_temp(ctx);
     ir_printf(ctx, out, "t%d = const int 0", zero);
     ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const decimal 1.0", one_dec);
     ir_printf(ctx, out, "t%d = const int %d", n_const, n);
 
     ir_printf(ctx, out, "store [t%d], t%d", i_addr, zero);
@@ -2603,7 +2612,7 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
         ir_printf(ctx, out, "t%d = load [t%d]", pivot, addr_pivot);
         one_val = new_temp(ctx);
         inv_pivot = new_temp(ctx);
-        ir_printf(ctx, out, "t%d = const int 1", one_val);
+        ir_printf(ctx, out, "t%d = const decimal 1.0", one_val);
         emit_safe_div(ctx, inv_pivot, one_val, pivot, out);
 
         ir_printf(ctx, out, "store [t%d], t%d", j_addr, zero);
@@ -2623,6 +2632,8 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             int addr_inv;
             int val_a;
             int val_inv;
+            int val_a_f;
+            int val_inv_f;
             int new_a;
             int new_inv;
 
@@ -2631,12 +2642,16 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             addr_inv = emit_matrix_elem_addr(ctx, dst, i_val, j_val, out);
             val_a = new_temp(ctx);
             val_inv = new_temp(ctx);
+            val_a_f = new_temp(ctx);
+            val_inv_f = new_temp(ctx);
             new_a = new_temp(ctx);
             new_inv = new_temp(ctx);
             ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
             ir_printf(ctx, out, "t%d = load [t%d]", val_inv, addr_inv);
-            ir_printf(ctx, out, "t%d = * t%d, t%d", new_a, val_a, inv_pivot);
-            ir_printf(ctx, out, "t%d = * t%d, t%d", new_inv, val_inv, inv_pivot);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_a_f, val_a, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_inv_f, val_inv, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", new_a, val_a_f, inv_pivot);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", new_inv, val_inv_f, inv_pivot);
             ir_printf(ctx, out, "store [t%d], t%d", addr_a, new_a);
             ir_printf(ctx, out, "store [t%d], t%d", addr_inv, new_inv);
         }
@@ -2682,14 +2697,9 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
     {
         int i_val = new_temp(ctx);
         int r_val = new_temp(ctx);
-        int addr_factor;
-        int factor;
 
         ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
         ir_printf(ctx, out, "t%d = load %s", r_val, r_var);
-        addr_factor = emit_matrix_elem_addr(ctx, a_name, r_val, i_val, out);
-        factor = new_temp(ctx);
-        ir_printf(ctx, out, "t%d = load [t%d]", factor, addr_factor);
 
         ir_printf(ctx, out, "store [t%d], t%d", j_addr, zero);
         j_label = new_label(ctx);
@@ -2704,6 +2714,9 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
         }
         {
             int j_val = new_temp(ctx);
+            int addr_factor;
+            int factor;
+            int factor_f;
             int addr_a_r;
             int addr_a_i;
             int addr_inv_r;
@@ -2712,35 +2725,53 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             int val_a_i;
             int val_inv_r;
             int val_inv_i;
+            int val_a_r_f;
+            int val_a_i_f;
+            int val_inv_r_f;
+            int val_inv_i_f;
             int mul_a;
             int mul_inv;
             int new_a;
             int new_inv;
 
             ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+            addr_factor = emit_matrix_elem_addr(ctx, a_name, r_val, i_val, out);
             addr_a_r = emit_matrix_elem_addr(ctx, a_name, r_val, j_val, out);
             addr_a_i = emit_matrix_elem_addr(ctx, a_name, i_val, j_val, out);
             addr_inv_r = emit_matrix_elem_addr(ctx, dst, r_val, j_val, out);
             addr_inv_i = emit_matrix_elem_addr(ctx, dst, i_val, j_val, out);
 
+            factor = new_temp(ctx);
+            factor_f = new_temp(ctx);
             val_a_r = new_temp(ctx);
             val_a_i = new_temp(ctx);
             val_inv_r = new_temp(ctx);
             val_inv_i = new_temp(ctx);
+            val_a_r_f = new_temp(ctx);
+            val_a_i_f = new_temp(ctx);
+            val_inv_r_f = new_temp(ctx);
+            val_inv_i_f = new_temp(ctx);
             mul_a = new_temp(ctx);
             mul_inv = new_temp(ctx);
             new_a = new_temp(ctx);
             new_inv = new_temp(ctx);
 
+            ir_printf(ctx, out, "t%d = load [t%d]", factor, addr_factor);
             ir_printf(ctx, out, "t%d = load [t%d]", val_a_r, addr_a_r);
             ir_printf(ctx, out, "t%d = load [t%d]", val_a_i, addr_a_i);
             ir_printf(ctx, out, "t%d = load [t%d]", val_inv_r, addr_inv_r);
             ir_printf(ctx, out, "t%d = load [t%d]", val_inv_i, addr_inv_i);
 
-            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_a, factor, val_a_i);
-            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_inv, factor, val_inv_i);
-            ir_printf(ctx, out, "t%d = - t%d, t%d", new_a, val_a_r, mul_a);
-            ir_printf(ctx, out, "t%d = - t%d, t%d", new_inv, val_inv_r, mul_inv);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", factor_f, factor, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_a_r_f, val_a_r, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_a_i_f, val_a_i, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_inv_r_f, val_inv_r, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_inv_i_f, val_inv_i, one_dec);
+
+            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_a, factor_f, val_a_i_f);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_inv, factor_f, val_inv_i_f);
+            ir_printf(ctx, out, "t%d = - t%d, t%d", new_a, val_a_r_f, mul_a);
+            ir_printf(ctx, out, "t%d = - t%d, t%d", new_inv, val_inv_r_f, mul_inv);
             ir_printf(ctx, out, "store [t%d], t%d", addr_a_r, new_a);
             ir_printf(ctx, out, "store [t%d], t%d", addr_inv_r, new_inv);
         }
@@ -3475,55 +3506,6 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                     return;
                                 }
                             }
-                        }
-                    }
-                    if (matrix_is_identity(src_info)) {
-                        if (emit_matrix_identity_fill(ctx, node->value, src_info->rows, out)) {
-                            matrix_props_set(lhs_info, 1, 0, 1, 1, 1, 1, 1);
-                            if (inv_key) {
-                                mat_cache_add(&ctx->mat_cse_cache, inv_key, node->value);
-                                inv_key = NULL;
-                            }
-                            matrix_invalidate_name(ctx, node->value);
-                            return;
-                        }
-                    }
-                    if (matrix_is_diagonal(src_info)) {
-                        if (emit_matrix_inverse_diagonal(ctx, node->value, src_name, src_info->rows, out)) {
-                            matrix_props_set(lhs_info, 1, 0, 0, 1, 1, 1, 1);
-                            if (inv_key) {
-                                mat_cache_add(&ctx->mat_cse_cache, inv_key, node->value);
-                                inv_key = NULL;
-                            }
-                            matrix_invalidate_name(ctx, node->value);
-                            return;
-                        }
-                    }
-                    if (src_info->rows == 1) {
-                        if (emit_matrix_inverse_diagonal(ctx, node->value, src_name, 1, out)) {
-                            matrix_props_unknown(lhs_info);
-                            if (inv_key) {
-                                mat_cache_add(&ctx->mat_cse_cache, inv_key, node->value);
-                                inv_key = NULL;
-                            }
-                            matrix_invalidate_name(ctx, node->value);
-                            return;
-                        }
-                    }
-                    if (matrix_is_upper_triangular(src_info) || matrix_is_lower_triangular(src_info)) {
-                        int is_upper = matrix_is_upper_triangular(src_info);
-                        if (emit_matrix_inverse_triangular(ctx, node->value, src_name, src_info->rows, is_upper, out)) {
-                            int is_diag = matrix_is_diagonal(src_info);
-                            int is_sym = is_diag ? 1 : 0;
-                            matrix_props_set(lhs_info, 1, 0, 0, is_diag, is_sym,
-                                             matrix_is_upper_triangular(src_info),
-                                             matrix_is_lower_triangular(src_info));
-                            if (inv_key) {
-                                mat_cache_add(&ctx->mat_cse_cache, inv_key, node->value);
-                                inv_key = NULL;
-                            }
-                            matrix_invalidate_name(ctx, node->value);
-                            return;
                         }
                     }
                     if (emit_matrix_inverse(ctx, node->value, src_name, src_info->rows, out)) {
@@ -4427,6 +4409,7 @@ static int emit_matrix_inverse_triangular(IRContext *ctx, const char *dst, const
     int k_addr;
     int zero;
     int one;
+    int one_dec;
     int n_const;
     int neg_one;
     int col_label;
@@ -5286,7 +5269,7 @@ static int emit_matrix_mul_diag_left(IRContext *ctx, const char *dst, const char
     rows_const = new_temp(ctx);
     cols_const = new_temp(ctx);
     ir_printf(ctx, out, "t%d = const int 0", zero);
-    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const decimal 1.0", one);
     ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
     ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
     four = new_temp(ctx);

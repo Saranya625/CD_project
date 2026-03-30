@@ -40,6 +40,7 @@
 
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,7 @@
 #define MAX_STRINGS  256
 #define MAX_LINE     512
 #define REG_POOL       6    /* t0..t5 (t6 reserved as scratch) */
+#define FREG_POOL      8    /* ft0..ft7 */
 
 /* ================================================================== */
 /*  IR storage                                                          */
@@ -74,6 +76,7 @@ typedef struct {
     SymKind kind;
     int     elems;   /* 1 for scalar; rows*cols for matrix */
     int     cols;    /* matrix cols (0 for scalar/array)   */
+    int     mem_is_float;
 } Symbol;
 
 static Symbol g_syms[MAX_SYMS];
@@ -105,6 +108,12 @@ static int      g_last_use[MAX_TEMPS + 1];
 static int      g_cur_line = 0;
 static int      g_spilled[MAX_TEMPS + 1];
 
+typedef enum { TK_UNKNOWN = 0, TK_INT, TK_FLOAT, TK_ADDR } TempKind;
+static TempKind  g_tkind[MAX_TEMPS + 1];
+static int       g_taddr_base[MAX_TEMPS + 1];
+static int       g_fconst_known[MAX_TEMPS + 1];
+static uint32_t  g_fconst_bits[MAX_TEMPS + 1];
+
 /* ================================================================== */
 /*  Register cache                                                      */
 /* ================================================================== */
@@ -113,9 +122,16 @@ static int g_rcache[MAX_TEMPS + 1]; /* temp → slot index or -1        */
 static int g_rowner[REG_POOL];      /* slot → temp number or 0        */
 static int g_rlru  [REG_POOL];      /* LRU counter per slot           */
 static int g_lru_clk = 0;
+static int g_fcache[MAX_TEMPS + 1];
+static int g_fowner[FREG_POOL];
+static int g_flru  [FREG_POOL];
+static int g_flru_clk = 0;
 
 static const char *g_rnames[REG_POOL] = {
     "t0","t1","t2","t3","t4","t5"
+};
+static const char *g_frnames[FREG_POOL] = {
+    "ft1","ft2","ft3","ft4","ft5","ft6","ft7","fa1"
 };
 
 /* ================================================================== */
@@ -170,6 +186,13 @@ static void sanitize_name(char *s)
     int n = (int)strlen(s);
     while (n > 0 && isspace((unsigned char)s[n-1])) s[--n] = '\0';
     while (n > 0 && s[n-1] == ',') s[--n] = '\0';
+}
+
+static uint32_t float_bits_from_text(const char *s)
+{
+    union { float f; uint32_t u; } cvt;
+    cvt.f = (float) atof(s ? s : "0");
+    return cvt.u;
 }
 
 static void note_temp_in_line(const char *ln)
@@ -256,6 +279,12 @@ static Symbol *sym_find(const char *n)
         if (strcmp(g_syms[i].name,n)==0) return &g_syms[i];
     return NULL;
 }
+static int sym_index(const char *n)
+{
+    for (int i = 0; i < g_nsyms; i++)
+        if (strcmp(g_syms[i].name, n) == 0) return i;
+    return -1;
+}
 static void sym_add(const char *n, SymKind k, int elems, int cols)
 {
     Symbol *s = sym_find(n);
@@ -268,19 +297,30 @@ static void sym_add(const char *n, SymKind k, int elems, int cols)
     }
     if (g_nsyms>=MAX_SYMS) return;
     s = &g_syms[g_nsyms++];
-    strncpy(s->name,n,127); s->kind=k; s->elems=elems; s->cols=cols;
+    strncpy(s->name,n,127); s->name[127]='\0';
+    s->kind=k; s->elems=elems; s->cols=cols; s->mem_is_float=0;
 }
 
 static void pass1_collect(void)
 {
-    char name[128]; int rows,cols,sz;
+    char dtype[32], name[128]; int rows,cols,sz;
     g_nsyms=g_nstrs=g_max_temp=0;
     memset(g_tm,0,sizeof(g_tm));
+    memset(g_tkind,0,sizeof(g_tkind));
+    memset(g_taddr_base,-1,sizeof(g_taddr_base));
+    memset(g_fconst_known,0,sizeof(g_fconst_known));
 
     for (int i=0;i<g_nlines;i++) {
         const char *ln=g_lines[i];
-        if (sscanf(ln,"decl %*s %127s",name)==1)
-            { sanitize_name(name); sym_add(name,SYM_SCALAR,1,0); continue; }
+        if (sscanf(ln,"decl %31s %127s",dtype,name)==2) {
+            sanitize_name(name);
+            sym_add(name,SYM_SCALAR,1,0);
+            if (!strcmp(dtype, "decimal")) {
+                Symbol *s = sym_find(name);
+                if (s) s->mem_is_float = 1;
+            }
+            continue;
+        }
         if (sscanf(ln,"decl_array %127[^,], %d",name,&sz)==2)
             { sanitize_name(name); sym_add(name,SYM_ARRAY,sz,0); continue; }
         if (sscanf(ln,"decl_matrix %127[^,], %d, %d",name,&rows,&cols)==3)
@@ -326,7 +366,7 @@ static void compute_last_use(void)
 /* Re-scan IR lines to ensure decl_array/decl_matrix are honored. */
 static void ensure_decl_syms_from_ir(void)
 {
-    char name[128]; int rows, cols, sz;
+    char dtype[32], name[128]; int rows, cols, sz;
     for (int i=0;i<g_nlines;i++) {
         const char *ln = g_lines[i];
         if (sscanf(ln,"decl_matrix %127[^,], %d, %d",name,&rows,&cols)==3) {
@@ -339,10 +379,150 @@ static void ensure_decl_syms_from_ir(void)
             sym_add(name, SYM_ARRAY, sz, 0);
             continue;
         }
-        if (sscanf(ln,"decl %*s %127s",name)==1) {
+        if (sscanf(ln,"decl %31s %127s",dtype,name)==2) {
             sanitize_name(name);
             sym_add(name, SYM_SCALAR, 1, 0);
+            if (!strcmp(dtype, "decimal")) {
+                Symbol *s = sym_find(name);
+                if (s) s->mem_is_float = 1;
+            }
             continue;
+        }
+    }
+}
+
+static TempKind combine_numeric_kind(TempKind a, TempKind b)
+{
+    if (a == TK_FLOAT || b == TK_FLOAT) return TK_FLOAT;
+    if (a == TK_ADDR || b == TK_ADDR) return TK_INT;
+    if (a == TK_INT || b == TK_INT) return TK_INT;
+    return TK_UNKNOWN;
+}
+
+static void infer_temp_kinds(void)
+{
+    char kind[32], sval[128], name[128], op[32];
+    int def, src, lhs, rhs, addr, val;
+
+    memset(g_tkind, 0, sizeof(g_tkind));
+    memset(g_taddr_base, 0xFF, sizeof(g_taddr_base));
+    memset(g_fconst_known, 0, sizeof(g_fconst_known));
+
+    for (int i = 0; i < g_nlines; i++) {
+        const char *ln = g_lines[i];
+        if (!ln || !*ln || ln[0] == '#') continue;
+
+        if (sscanf(ln,"t%d = const %31s %127s",&def,kind,sval)==3) {
+            g_fconst_known[def] = 0;
+            if (!strcmp(kind, "decimal")) {
+                g_tkind[def] = TK_FLOAT;
+                g_fconst_known[def] = 1;
+                g_fconst_bits[def] = float_bits_from_text(sval);
+            } else {
+                g_tkind[def] = TK_INT;
+            }
+            g_taddr_base[def] = -1;
+            continue;
+        }
+        if (sscanf(ln,"t%d = addr %127s",&def,name)==2) {
+            sanitize_name(name);
+            g_fconst_known[def] = 0;
+            g_tkind[def] = TK_ADDR;
+            g_taddr_base[def] = sym_index(name);
+            continue;
+        }
+        if (sscanf(ln,"t%d = load %127s",&def,name)==2 && name[0] != '[') {
+            Symbol *s;
+            sanitize_name(name);
+            s = sym_find(name);
+            g_fconst_known[def] = 0;
+            g_tkind[def] = (s && s->mem_is_float) ? TK_FLOAT : TK_INT;
+            g_taddr_base[def] = -1;
+            continue;
+        }
+        if (sscanf(ln,"t%d = load [t%d]",&def,&addr)==2) {
+            int base = (addr > 0 && addr <= MAX_TEMPS) ? g_taddr_base[addr] : -1;
+            g_fconst_known[def] = 0;
+            g_tkind[def] = (base >= 0 && g_syms[base].mem_is_float) ? TK_FLOAT : TK_INT;
+            g_taddr_base[def] = -1;
+            continue;
+        }
+        if (sscanf(ln,"store [t%d], t%d",&addr,&val)==2) {
+            int base = (addr > 0 && addr <= MAX_TEMPS) ? g_taddr_base[addr] : -1;
+            if (base >= 0 && val > 0 && val <= MAX_TEMPS) {
+                g_syms[base].mem_is_float = (g_tkind[val] == TK_FLOAT);
+            }
+            continue;
+        }
+        if (sscanf(ln,"t%d = mov t%d",&def,&src)==2) {
+            g_fconst_known[def] = 0;
+            g_tkind[def] = g_tkind[src];
+            g_taddr_base[def] = g_taddr_base[src];
+            if (g_tkind[def] == TK_FLOAT && g_fconst_known[src]) {
+                g_fconst_known[def] = 1;
+                g_fconst_bits[def] = g_fconst_bits[src];
+            }
+            continue;
+        }
+        if (sscanf(ln,"t%d = mul t%d, cols(%127[^)])",&def,&src,name)==3) {
+            g_fconst_known[def] = 0;
+            g_tkind[def] = TK_INT;
+            g_taddr_base[def] = -1;
+            continue;
+        }
+        if (sscanf(ln,"t%d = mul t%d, %127s",&def,&src,sval)==3 && is_imm(sval)) {
+            g_fconst_known[def] = 0;
+            g_tkind[def] = TK_INT;
+            g_taddr_base[def] = -1;
+            continue;
+        }
+        if (sscanf(ln,"t%d = %31s t%d, t%d",&def,op,&lhs,&rhs)==4) {
+            g_fconst_known[def] = 0;
+            if (!strcmp(op,"eq") || !strcmp(op,"ne") || !strcmp(op,"lt") ||
+                !strcmp(op,"gt") || !strcmp(op,"le") || !strcmp(op,"ge") ||
+                !strcmp(op,"and") || !strcmp(op,"or")) {
+                g_tkind[def] = TK_INT;
+                g_taddr_base[def] = -1;
+                continue;
+            }
+            g_tkind[def] = combine_numeric_kind(g_tkind[lhs], g_tkind[rhs]);
+            if ((!strcmp(op,"add") || !strcmp(op,"+")) &&
+                lhs > 0 && lhs <= MAX_TEMPS && rhs > 0 && rhs <= MAX_TEMPS) {
+                if (g_taddr_base[lhs] >= 0 && g_taddr_base[rhs] < 0) {
+                    g_taddr_base[def] = g_taddr_base[lhs];
+                } else if (g_taddr_base[rhs] >= 0 && g_taddr_base[lhs] < 0) {
+                    g_taddr_base[def] = g_taddr_base[rhs];
+                } else {
+                    g_taddr_base[def] = -1;
+                }
+            } else {
+                g_taddr_base[def] = -1;
+            }
+            continue;
+        }
+        if (sscanf(ln,"t%d = %31s t%d, %127s",&def,op,&lhs,sval)==4) {
+            g_fconst_known[def] = 0;
+            if (!strcmp(op,"eq") || !strcmp(op,"ne") || !strcmp(op,"lt") ||
+                !strcmp(op,"gt") || !strcmp(op,"le") || !strcmp(op,"ge") ||
+                !strcmp(op,"and") || !strcmp(op,"or")) {
+                g_tkind[def] = TK_INT;
+            } else if (strchr(sval, '.')) {
+                g_tkind[def] = TK_FLOAT;
+            } else {
+                g_tkind[def] = g_tkind[lhs] == TK_FLOAT ? TK_FLOAT : TK_INT;
+            }
+            if ((!strcmp(op,"add") || !strcmp(op,"+")) &&
+                lhs > 0 && lhs <= MAX_TEMPS && g_taddr_base[lhs] >= 0 && !strchr(sval, '.')) {
+                g_taddr_base[def] = g_taddr_base[lhs];
+            } else {
+                g_taddr_base[def] = -1;
+            }
+            continue;
+        }
+        if (sscanf(ln,"t%d = %31s t%d",&def,op,&src)==3) {
+            g_fconst_known[def] = 0;
+            g_tkind[def] = !strcmp(op, "not") ? TK_INT : g_tkind[src];
+            g_taddr_base[def] = -1;
         }
     }
 }
@@ -680,6 +860,9 @@ static void rc_spill_slot(int slot, FILE *out)
 {
     int t = g_rowner[slot];
     if (t > 0) {
+        if (g_tkind[t] == TK_ADDR) {
+            return;
+        }
         if (g_last_use[t] > g_cur_line) {
             g_spilled[t] = 1;
             fprintf(out,"\tla\tt6, t_%d\n", t);
@@ -697,6 +880,21 @@ static void rc_flush(FILE *out)
     memset(g_rowner,0, sizeof(g_rowner));
     memset(g_rlru,  0, sizeof(g_rlru));
     g_lru_clk=0;
+
+    if (out) {
+        for (int r = 0; r < FREG_POOL; r++) {
+            int t = g_fowner[r];
+            if (t > 0) {
+                g_spilled[t] = 1;
+                fprintf(out,"\tla\tt6, t_%d\n", t);
+                fprintf(out,"\tfsw\t%s, 0(t6)\n", g_frnames[r]);
+            }
+        }
+    }
+    memset(g_fcache,-1,sizeof(g_fcache));
+    memset(g_fowner,0,sizeof(g_fowner));
+    memset(g_flru,0,sizeof(g_flru));
+    g_flru_clk = 0;
 }
 
 static const char *rc_of(int t)
@@ -729,6 +927,34 @@ static int rc_alloc(int t, FILE *out)
     return slot;
 }
 
+static int fc_evict(FILE *out)
+{
+    int oldest = 0;
+    for (int r = 1; r < FREG_POOL; r++) if (g_flru[r] < g_flru[oldest]) oldest = r;
+    if (g_fowner[oldest] > 0) {
+        int t = g_fowner[oldest];
+        if (out && g_last_use[t] > g_cur_line) {
+            g_spilled[t] = 1;
+            fprintf(out,"\tla\tt6, t_%d\n", t);
+            fprintf(out,"\tfsw\t%s, 0(t6)\n", g_frnames[oldest]);
+        }
+        g_fcache[t] = -1;
+    }
+    g_fowner[oldest] = 0;
+    return oldest;
+}
+
+static int fc_alloc(int t, FILE *out)
+{
+    if (g_fcache[t] >= 0) { g_flru[g_fcache[t]] = ++g_flru_clk; return g_fcache[t]; }
+    int slot = -1;
+    for (int r = 0; r < FREG_POOL; r++) if (!g_fowner[r]) { slot = r; break; }
+    if (slot < 0) slot = fc_evict(out);
+    if (g_fowner[slot]) g_fcache[g_fowner[slot]] = -1;
+    g_fowner[slot] = t; g_fcache[t] = slot; g_flru[slot] = ++g_flru_clk;
+    return slot;
+}
+
 /* ── Emission helpers ──────────────────────────────────────────── */
 
 /*
@@ -744,11 +970,46 @@ static const char *ld_tmp(int t, FILE *out)
     if (c) return c;
     int slot = rc_alloc(t, out);
     const char *r = g_rnames[slot];
+    if (g_tkind[t] == TK_ADDR && g_taddr_base[t] >= 0 && g_taddr_base[t] < g_nsyms) {
+        fprintf(out,"\tla\t%s, %s\n", r, g_syms[g_taddr_base[t]].name);
+        return r;
+    }
     if (g_tm[t].has_const) {
         fprintf(out,"\tli\t%s, %lld\n", r, g_tm[t].cval);
     } else {
         fprintf(out,"\tla\tt6, t_%d\n", t);
         fprintf(out,"\tlw\t%s, 0(t6)\n", r);
+    }
+    return r;
+}
+
+static const char *ld_tmp_f(int t, FILE *out)
+{
+    int slot;
+    const char *r;
+
+    if (t > 0 && t <= MAX_TEMPS && g_tkind[t] == TK_FLOAT && g_fcache[t] >= 0) {
+        g_flru[g_fcache[t]] = ++g_flru_clk;
+        return g_frnames[g_fcache[t]];
+    }
+
+    slot = fc_alloc(t, out);
+    r = g_frnames[slot];
+
+    if (t > 0 && t <= MAX_TEMPS && g_tkind[t] == TK_FLOAT) {
+        if (g_fconst_known[t]) {
+            fprintf(out,"\tli\tt6, %u\n", g_fconst_bits[t]);
+            fprintf(out,"\tfmv.w.x\t%s, t6\n", r);
+        } else {
+            fprintf(out,"\tla\tt6, t_%d\n", t);
+            fprintf(out,"\tflw\t%s, 0(t6)\n", r);
+        }
+        return r;
+    }
+
+    {
+        const char *ri = ld_tmp(t, out);
+        fprintf(out,"\tfcvt.s.w\t%s, %s\n", r, ri);
     }
     return r;
 }
@@ -772,10 +1033,29 @@ static void st_tmp(int t, const char *reg, FILE *out)
     }
 }
 
+static void st_tmp_f(int t, const char *reg, FILE *out)
+{
+    fprintf(out,"\tla\tt6, t_%d\n", t);
+    fprintf(out,"\tfsw\t%s, 0(t6)\n", reg);
+    for (int r = 0; r < FREG_POOL; r++) {
+        if (!strcmp(g_frnames[r], reg)) {
+            if (g_fowner[r] && g_fowner[r] != t) g_fcache[g_fowner[r]] = -1;
+            g_fowner[r] = t; g_fcache[t] = r; g_flru[r] = ++g_flru_clk;
+            break;
+        }
+    }
+}
+
 static void ld_name(const char *name, const char *reg, FILE *out)
 {
     fprintf(out,"\tla\tt6, %s\n", name);
     fprintf(out,"\tlw\t%s, 0(t6)\n", reg);
+}
+
+static void ld_name_f(const char *name, const char *reg, FILE *out)
+{
+    fprintf(out,"\tla\tt6, %s\n", name);
+    fprintf(out,"\tflw\t%s, 0(t6)\n", reg);
 }
 
 static void st_name(const char *name, const char *reg, FILE *out)
@@ -811,8 +1091,9 @@ static void emit_one(const char *ln, FILE *out)
     /* ── ifz tA goto LN ─────────────────────────────────────────── */
     if (sscanf(ln,"ifz t%d goto L%d",&src,&label)==2) {
         const char *r=ld_tmp(src,out);
+        rc_flush(out);
         fprintf(out,"\tbeqz\t%s, L%d\n",r,label);
-        rc_flush(out); return;
+        return;
     }
 
     /* ── ret (user requested: emit no code) ─────────────────────── */
@@ -829,8 +1110,13 @@ static void emit_one(const char *ln, FILE *out)
 
     /* ── print tN ───────────────────────────────────────────────── */
     if (sscanf(ln,"print t%d",&src)==1) {
-        const char *r=ld_tmp(src,out);
-        fprintf(out,"\tmv\ta0, %s\n\tli\ta7, 1\n\tecall\n",r);
+        if (g_tkind[src] == TK_FLOAT) {
+            const char *r = ld_tmp_f(src,out);
+            fprintf(out,"\tfsgnj.s\tfa0, %s, %s\n\tli\ta7, 2\n\tecall\n",r,r);
+        } else {
+            const char *r=ld_tmp(src,out);
+            fprintf(out,"\tmv\ta0, %s\n\tli\ta7, 1\n\tecall\n",r);
+        }
         fprintf(out,"\tli\ta0, 10\n\tli\ta7, 11\n\tecall\n");
         return;
     }
@@ -848,25 +1134,40 @@ static void emit_one(const char *ln, FILE *out)
     /* ── store [tA], tB ─────────────────────────────────────────── */
     if (sscanf(ln,"store [t%d], t%d",&addr,&val)==2) {
         const char *ra=ld_tmp(addr,out);
-        const char *rv=ld_tmp(val, out);
-        /* if eviction aliased them, reload addr into t6 */
-        if (!strcmp(ra,rv)) {
-            fprintf(out,"\tmv\tt6, %s\n",ra); ra="t6";
+        if (g_tkind[val] == TK_FLOAT) {
+            const char *rv = ld_tmp_f(val, out);
+            fprintf(out,"\tfsw\t%s, 0(%s)\n",rv,ra);
+        } else {
+            const char *rv=ld_tmp(val, out);
+            /* if eviction aliased them, reload addr into t6 */
+            if (!strcmp(ra,rv)) {
+                fprintf(out,"\tmv\tt6, %s\n",ra); ra="t6";
+            }
+            fprintf(out,"\tsw\t%s, 0(%s)\n",rv,ra);
         }
-        fprintf(out,"\tsw\t%s, 0(%s)\n",rv,ra);
         return;
     }
 
     /* ── tN = const K ────────────────────────────────────────────── */
     if (sscanf(ln,"t%d = const %31s %127s",&def,kind,sval)==3) {
-        int slot=rc_alloc(def, out);
-        const char *r=g_rnames[slot];
-        if (!strcmp(kind,"int")&&is_imm(sval)) {
-            long long v=atoll(sval);
-            fprintf(out,"\tli\t%s, %lld\n",r,v);
-            g_tm[def].has_const=1; g_tm[def].cval=v;
+        if (!strcmp(kind,"decimal")) {
+            int slot = fc_alloc(def, out);
+            const char *r = g_frnames[slot];
+            uint32_t bits = float_bits_from_text(sval);
+            g_fconst_known[def] = 1;
+            g_fconst_bits[def] = bits;
+            fprintf(out,"\tli\tt6, %u\n", bits);
+            fprintf(out,"\tfmv.w.x\t%s, t6\n", r);
         } else {
-            fprintf(out,"\tli\t%s, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+            int slot=rc_alloc(def, out);
+            const char *r=g_rnames[slot];
+            if (!strcmp(kind,"int")&&is_imm(sval)) {
+                long long v=atoll(sval);
+                fprintf(out,"\tli\t%s, %lld\n",r,v);
+                g_tm[def].has_const=1; g_tm[def].cval=v;
+            } else {
+                fprintf(out,"\tli\t%s, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+            }
         }
         return;
     }
@@ -880,34 +1181,57 @@ static void emit_one(const char *ln, FILE *out)
 
     /* ── tN = load <name>  (scalar) ─────────────────────────── */
     if (sscanf(ln,"t%d = load %127s",&def,name)==2 && name[0]!='[') {
-        int slot=rc_alloc(def, out);
-        const char *r=g_rnames[slot];
-        ld_name(name,r,out);
+        g_fconst_known[def] = 0;
+        if (g_tkind[def] == TK_FLOAT) {
+            int slot=fc_alloc(def, out);
+            const char *r=g_frnames[slot];
+            ld_name_f(name,r,out);
+        } else {
+            int slot=rc_alloc(def, out);
+            const char *r=g_rnames[slot];
+            ld_name(name,r,out);
+        }
         return;
     }
 
     /* ── tN = load [tM] ─────────────────────────────────────────── */
     if (sscanf(ln,"t%d = load [t%d]",&def,&addr)==2) {
+        g_fconst_known[def] = 0;
         const char *ra=ld_tmp(addr,out);
-        int slot=rc_alloc(def, out);
-        const char *rd=g_rnames[slot];
-        if (!strcmp(ra,rd)) {
-            fprintf(out,"\tmv\tt6, %s\n",ra);
-            fprintf(out,"\tlw\t%s, 0(t6)\n",rd);
+        if (g_tkind[def] == TK_FLOAT) {
+            int slot=fc_alloc(def, out);
+            const char *rd=g_frnames[slot];
+            fprintf(out,"\tflw\t%s, 0(%s)\n",rd,ra);
         } else {
-            fprintf(out,"\tlw\t%s, 0(%s)\n",rd,ra);
+            int slot=rc_alloc(def, out);
+            const char *rd=g_rnames[slot];
+            if (!strcmp(ra,rd)) {
+                fprintf(out,"\tmv\tt6, %s\n",ra);
+                fprintf(out,"\tlw\t%s, 0(t6)\n",rd);
+            } else {
+                fprintf(out,"\tlw\t%s, 0(%s)\n",rd,ra);
+            }
+            g_tm[def].has_const=0;
         }
-        g_tm[def].has_const=0;
         return;
     }
 
     /* ── tN = mov tM ─────────────────────────────────────────────── */
     if (sscanf(ln,"t%d = mov t%d",&def,&src)==2) {
-        const char *rs=ld_tmp(src,out);
-        int slot=rc_alloc(def, out);
-        const char *rd=g_rnames[slot];
-        if (strcmp(rs,rd)) fprintf(out,"\tmv\t%s, %s\n",rd,rs);
-        if (g_tm[src].has_const) { g_tm[def].has_const=1; g_tm[def].cval=g_tm[src].cval; }
+        if (g_tkind[def] == TK_FLOAT) {
+            g_fconst_known[def] = g_fconst_known[src];
+            if (g_fconst_known[def]) g_fconst_bits[def] = g_fconst_bits[src];
+            const char *rs=ld_tmp_f(src,out);
+            int slot=fc_alloc(def, out);
+            const char *rd=g_frnames[slot];
+            if (strcmp(rs,rd)) fprintf(out,"\tfsgnj.s\t%s, %s, %s\n",rd,rs,rs);
+        } else {
+            const char *rs=ld_tmp(src,out);
+            int slot=rc_alloc(def, out);
+            const char *rd=g_rnames[slot];
+            if (strcmp(rs,rd)) fprintf(out,"\tmv\t%s, %s\n",rd,rs);
+            if (g_tm[src].has_const) { g_tm[def].has_const=1; g_tm[def].cval=g_tm[src].cval; }
+        }
         return;
     }
 
@@ -961,6 +1285,51 @@ static void emit_one(const char *ln, FILE *out)
 
     /* ── tN = <op> tA, tB ────────────────────────────────────────── */
     if (sscanf(ln,"t%d = %31s t%d, t%d",&def,op,&lhs,&rhs)==4) {
+        if (g_tkind[def] == TK_FLOAT) {
+            g_fconst_known[def] = 0;
+            const char *r1 = ld_tmp_f(lhs,out);
+            const char *r2 = ld_tmp_f(rhs,out);
+            int slot = fc_alloc(def, out);
+            const char *rd = g_frnames[slot];
+
+            if      (!strcmp(op,"+")||!strcmp(op,"add"))
+                fprintf(out,"\tfadd.s\t%s, %s, %s\n",rd,r1,r2);
+            else if (!strcmp(op,"-")||!strcmp(op,"sub"))
+                fprintf(out,"\tfsub.s\t%s, %s, %s\n",rd,r1,r2);
+            else if (!strcmp(op,"*")||!strcmp(op,"mul"))
+                fprintf(out,"\tfmul.s\t%s, %s, %s\n",rd,r1,r2);
+            else if (!strcmp(op,"/"))
+                fprintf(out,"\tfdiv.s\t%s, %s, %s\n",rd,r1,r2);
+            else
+                fprintf(out,"\t# [?fbinop] %s\n",ln);
+            return;
+        }
+
+        if (g_tkind[lhs] == TK_FLOAT || g_tkind[rhs] == TK_FLOAT) {
+            const char *r1 = ld_tmp_f(lhs,out);
+            const char *r2 = ld_tmp_f(rhs,out);
+            int slot = rc_alloc(def, out);
+            const char *rd = g_rnames[slot];
+
+            if (!strcmp(op,"eq"))
+                fprintf(out,"\tfeq.s\t%s, %s, %s\n",rd,r1,r2);
+            else if (!strcmp(op,"ne")) {
+                fprintf(out,"\tfeq.s\t%s, %s, %s\n",rd,r1,r2);
+                fprintf(out,"\txori\t%s, %s, 1\n",rd,rd);
+            } else if (!strcmp(op,"lt"))
+                fprintf(out,"\tflt.s\t%s, %s, %s\n",rd,r1,r2);
+            else if (!strcmp(op,"gt"))
+                fprintf(out,"\tflt.s\t%s, %s, %s\n",rd,r2,r1);
+            else if (!strcmp(op,"le"))
+                fprintf(out,"\tfle.s\t%s, %s, %s\n",rd,r1,r2);
+            else if (!strcmp(op,"ge"))
+                fprintf(out,"\tfle.s\t%s, %s, %s\n",rd,r2,r1);
+            else
+                fprintf(out,"\t# [?fcmp] %s\n",ln);
+            g_tm[def].has_const=0;
+            return;
+        }
+
         /* immediate forms */
         if (!strcmp(op,"+") || !strcmp(op,"add")) {
             if (g_tm[rhs].has_const && is_simm12(g_tm[rhs].cval)) {
@@ -1059,13 +1428,22 @@ static void emit_one(const char *ln, FILE *out)
 
     /* ── tN = <op> tA  (unary) ──────────────────────────────────── */
     if (sscanf(ln,"t%d = %31s t%d",&def,op,&src)==3) {
-        const char *rs=ld_tmp(src,out);
-        int slot=rc_alloc(def, out);
-        const char *rd=g_rnames[slot];
-        if (!strcmp(op,"uminus"))fprintf(out,"\tneg\t%s, %s\n",rd,rs);
-        else if (!strcmp(op,"not"))   fprintf(out,"\tseqz\t%s, %s\n",rd,rs);
-        else fprintf(out,"\t# [?unary] %s\n",ln);
-        g_tm[def].has_const=0;
+        if (g_tkind[def] == TK_FLOAT) {
+            g_fconst_known[def] = 0;
+            const char *rs=ld_tmp_f(src,out);
+            int slot=fc_alloc(def, out);
+            const char *rd=g_frnames[slot];
+            if (!strcmp(op,"uminus"))fprintf(out,"\tfneg.s\t%s, %s\n",rd,rs);
+            else fprintf(out,"\t# [?funary] %s\n",ln);
+        } else {
+            const char *rs=ld_tmp(src,out);
+            int slot=rc_alloc(def, out);
+            const char *rd=g_rnames[slot];
+            if (!strcmp(op,"uminus"))fprintf(out,"\tneg\t%s, %s\n",rd,rs);
+            else if (!strcmp(op,"not"))   fprintf(out,"\tseqz\t%s, %s\n",rd,rs);
+            else fprintf(out,"\t# [?unary] %s\n",ln);
+            g_tm[def].has_const=0;
+        }
         return;
     }
 
@@ -1146,6 +1524,7 @@ int generate_riscv(const char *ir_file, const char *asm_file)
     pass1_collect();
     pass2_opt();
     ensure_decl_syms_from_ir();
+    infer_temp_kinds();
     compute_last_use();
 
     /* Dry-run emission to mark which temps actually spill. */
