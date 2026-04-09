@@ -3,10 +3,8 @@ decl int x
 t1 = addr x
 t2 = const int 1
 store [t1], t2
-t3 = addr x
-t4 = load x
-t5 = + t4, t4
-store [t3], t5
-t6 = load x
-print t6
+t3 = mov t2
+print t2
+t4 = const int 0
+ret t4
 IR_END

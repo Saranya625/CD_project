@@ -13,6 +13,6 @@ ASTNode* createNode(char *type, char *value,
                     ASTNode *left,
                     ASTNode *right,
                     ASTNode *third);
-void printAST(ASTNode* node, int level);
+
 
 #endif
