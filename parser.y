@@ -721,9 +721,24 @@ void yyerror(const char *s) {
     fprintf(stderr, "Parse error at line %d: %s\n", line_no, s);
 }
 
-int main() {
+int main(int argc, char **argv) {
     int parse_ok;
     int semantic_ok = 0;
+    IROptLevel opt_level = IR_OPT_O1;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-O0") == 0) {
+            opt_level = IR_OPT_O0;
+        } else if (strcmp(argv[i], "-O1") == 0) {
+            opt_level = IR_OPT_O1;
+        } else if (strcmp(argv[i], "-O2") == 0) {
+            opt_level = IR_OPT_O2;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Supported options: -O0, -O1, -O2\n");
+            return 1;
+        }
+    }
 
     printf("Tokens Generated:\n");
     parse_ok = (yyparse() == 0);
@@ -740,8 +755,8 @@ int main() {
                 return 1; /* or YYABORT / appropriate error path */
             }
 
-            generate_ir(root, ir_out);
-            generate_ir(root, stdout);
+            generate_ir_level(root, ir_out, opt_level);
+            generate_ir_level(root, stdout, opt_level);
             fclose(ir_out);
         } else {
             printf("Semantic analysis failed with %d error(s).\n", semantic_error_count());

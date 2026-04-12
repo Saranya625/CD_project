@@ -3,8 +3,8 @@ CFLAGS = -Wall
 
 all: compiler ir2riscv
 
-compiler: parser.tab.c lex.yy.c semantic.c semantic.h ir.c ir.h
-	$(CC) $(CFLAGS) -o compiler parser.tab.c lex.yy.c semantic.c ir.c -lfl
+compiler: parser.tab.c lex.yy.c semantic.c semantic.h ir.c ir_o0.c ir_o2.c ir.h ir_internal.h
+	$(CC) $(CFLAGS) -o compiler parser.tab.c lex.yy.c semantic.c ir.c ir_o0.c ir_o2.c
 
 ir2riscv: riscv.c
 	$(CC) $(CFLAGS) -o ir2riscv riscv.c

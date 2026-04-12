@@ -170,6 +170,17 @@ static int is_simm12(long long v)
     return v >= -2048 && v <= 2047;
 }
 
+static void emit_load_imm(FILE *out, const char *rd, long long imm)
+{
+    if (is_simm12(imm)) fprintf(out,"\taddi\t%s, x0, %lld\n", rd, imm);
+    else                fprintf(out,"\tli\t%s, %lld\n", rd, imm);
+}
+
+static void emit_move(FILE *out, const char *rd, const char *rs)
+{
+    fprintf(out,"\taddi\t%s, %s, 0\n", rd, rs);
+}
+
 static int parse_tmp(const char *s, int *out)
 {
     if (!s || s[0] != 't' || !isdigit((unsigned char)s[1])) return 0;
@@ -975,7 +986,7 @@ static const char *ld_tmp(int t, FILE *out)
         return r;
     }
     if (g_tm[t].has_const) {
-        fprintf(out,"\tli\t%s, %lld\n", r, g_tm[t].cval);
+        emit_load_imm(out, r, g_tm[t].cval);
     } else {
         fprintf(out,"\tla\tt6, t_%d\n", t);
         fprintf(out,"\tlw\t%s, 0(t6)\n", r);
@@ -998,7 +1009,7 @@ static const char *ld_tmp_f(int t, FILE *out)
 
     if (t > 0 && t <= MAX_TEMPS && g_tkind[t] == TK_FLOAT) {
         if (g_fconst_known[t]) {
-            fprintf(out,"\tli\tt6, %u\n", g_fconst_bits[t]);
+            emit_load_imm(out, "t6", g_fconst_bits[t]);
             fprintf(out,"\tfmv.w.x\t%s, t6\n", r);
         } else {
             fprintf(out,"\tla\tt6, t_%d\n", t);
@@ -1104,7 +1115,9 @@ static void emit_one(const char *ln, FILE *out)
     if (!strncmp(ln,"print_str ",10)) {
         char txt[MAX_LINE]; extract_str(ln+10,txt,sizeof(txt));
         const char *lbl=reg_str(txt);
-        fprintf(out,"\tla\ta0, %s\n\tli\ta7, 4\n\tecall\n",lbl);
+        fprintf(out,"\tla\ta0, %s\n",lbl);
+        emit_load_imm(out, "a7", 4);
+        fprintf(out,"\tecall\n");
         return;
     }
 
@@ -1112,19 +1125,26 @@ static void emit_one(const char *ln, FILE *out)
     if (sscanf(ln,"print t%d",&src)==1) {
         if (g_tkind[src] == TK_FLOAT) {
             const char *r = ld_tmp_f(src,out);
-            fprintf(out,"\tfsgnj.s\tfa0, %s, %s\n\tli\ta7, 2\n\tecall\n",r,r);
+            fprintf(out,"\tfsgnj.s\tfa0, %s, %s\n",r,r);
+            emit_load_imm(out, "a7", 2);
+            fprintf(out,"\tecall\n");
         } else {
             const char *r=ld_tmp(src,out);
-            fprintf(out,"\tmv\ta0, %s\n\tli\ta7, 1\n\tecall\n",r);
+            emit_move(out, "a0", r);
+            emit_load_imm(out, "a7", 1);
+            fprintf(out,"\tecall\n");
         }
-        fprintf(out,"\tli\ta0, 10\n\tli\ta7, 11\n\tecall\n");
+        emit_load_imm(out, "a0", 10);
+        emit_load_imm(out, "a7", 11);
+        fprintf(out,"\tecall\n");
         return;
     }
 
     /* ── scan [tN] ──────────────────────────────────────────────── */
     if (sscanf(ln,"scan [t%d]",&addr)==1) {
         const char *ra=ld_tmp(addr,out);
-        fprintf(out,"\tli\ta7, 5\n\tecall\n\tsw\ta0, 0(%s)\n",ra);
+        emit_load_imm(out, "a7", 5);
+        fprintf(out,"\tecall\n\tsw\ta0, 0(%s)\n",ra);
         return;
     }
 
@@ -1141,7 +1161,7 @@ static void emit_one(const char *ln, FILE *out)
             const char *rv=ld_tmp(val, out);
             /* if eviction aliased them, reload addr into t6 */
             if (!strcmp(ra,rv)) {
-                fprintf(out,"\tmv\tt6, %s\n",ra); ra="t6";
+                emit_move(out, "t6", ra); ra="t6";
             }
             fprintf(out,"\tsw\t%s, 0(%s)\n",rv,ra);
         }
@@ -1156,17 +1176,21 @@ static void emit_one(const char *ln, FILE *out)
             uint32_t bits = float_bits_from_text(sval);
             g_fconst_known[def] = 1;
             g_fconst_bits[def] = bits;
-            fprintf(out,"\tli\tt6, %u\n", bits);
+            emit_load_imm(out, "t6", bits);
             fprintf(out,"\tfmv.w.x\t%s, t6\n", r);
         } else {
             int slot=rc_alloc(def, out);
             const char *r=g_rnames[slot];
             if (!strcmp(kind,"int")&&is_imm(sval)) {
                 long long v=atoll(sval);
-                fprintf(out,"\tli\t%s, %lld\n",r,v);
+                emit_load_imm(out, r, v);
                 g_tm[def].has_const=1; g_tm[def].cval=v;
             } else {
-                fprintf(out,"\tli\t%s, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+                if (is_simm12((long)atof(sval))) {
+                    fprintf(out,"\taddi\t%s, x0, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+                } else {
+                    fprintf(out,"\tli\t%s, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+                }
             }
         }
         return;
@@ -1206,7 +1230,7 @@ static void emit_one(const char *ln, FILE *out)
             int slot=rc_alloc(def, out);
             const char *rd=g_rnames[slot];
             if (!strcmp(ra,rd)) {
-                fprintf(out,"\tmv\tt6, %s\n",ra);
+                emit_move(out, "t6", ra);
                 fprintf(out,"\tlw\t%s, 0(t6)\n",rd);
             } else {
                 fprintf(out,"\tlw\t%s, 0(%s)\n",rd,ra);
@@ -1229,7 +1253,7 @@ static void emit_one(const char *ln, FILE *out)
             const char *rs=ld_tmp(src,out);
             int slot=rc_alloc(def, out);
             const char *rd=g_rnames[slot];
-            if (strcmp(rs,rd)) fprintf(out,"\tmv\t%s, %s\n",rd,rs);
+            if (strcmp(rs,rd)) emit_move(out, rd, rs);
             if (g_tm[src].has_const) { g_tm[def].has_const=1; g_tm[def].cval=g_tm[src].cval; }
         }
         return;
@@ -1246,15 +1270,16 @@ static void emit_one(const char *ln, FILE *out)
             int slot = rc_alloc(def, out);
             const char *rd = g_rnames[slot];
             if (cols == 1) {
-                if (strcmp(rs,rd)) fprintf(out,"\tmv\t%s, %s\n",rd,rs);
+                if (strcmp(rs,rd)) emit_move(out, rd, rs);
             } else if (cols > 0 && is_pow2(cols)) {
                 int sh = 0; int v = cols; while (v >>= 1) sh++;
                 fprintf(out,"\tslli\t%s, %s, %d\n",rd,rs,sh);
             } else if (cols > 0) {
-                fprintf(out,"\tli\tt6, %d\n\tmul\t%s, %s, t6\n",cols,rd,rs);
+                emit_load_imm(out, "t6", cols);
+                fprintf(out,"\tmul\t%s, %s, t6\n",rd,rs);
             } else {
                 fprintf(out,"\t# [warn] unknown cols(%s)\n",mname);
-                if (strcmp(rs,rd)) fprintf(out,"\tmv\t%s, %s\n",rd,rs);
+                if (strcmp(rs,rd)) emit_move(out, rd, rs);
             }
             g_tm[def].has_const=0;
             return;
@@ -1269,14 +1294,15 @@ static void emit_one(const char *ln, FILE *out)
             int slot = rc_alloc(def, out);
             const char *rd = g_rnames[slot];
             if (imm == 0) {
-                fprintf(out,"\tli\t%s, 0\n",rd);
+                emit_load_imm(out, rd, 0);
             } else if (imm == 1) {
-                if (strcmp(rs,rd)) fprintf(out,"\tmv\t%s, %s\n",rd,rs);
+                if (strcmp(rs,rd)) emit_move(out, rd, rs);
             } else if (is_pow2(imm)) {
                 int sh = 0; int v = imm; while (v >>= 1) sh++;
                 fprintf(out,"\tslli\t%s, %s, %d\n",rd,rs,sh);
             } else {
-                fprintf(out,"\tli\tt6, %d\n\tmul\t%s, %s, t6\n",imm,rd,rs);
+                emit_load_imm(out, "t6", imm);
+                fprintf(out,"\tmul\t%s, %s, t6\n",rd,rs);
             }
             g_tm[def].has_const=0;
             return;
@@ -1379,13 +1405,13 @@ static void emit_one(const char *ln, FILE *out)
 
         /* handle same-register operands */
         char r2b[8]; strncpy(r2b,r2,7);
-        if (!strcmp(r1,r2)) { fprintf(out,"\tmv\tt6, %s\n",r2); strncpy(r2b,"t6",7); }
+        if (!strcmp(r1,r2)) { emit_move(out, "t6", r2); strncpy(r2b,"t6",7); }
 
         int slot=rc_alloc(def, out);
         const char *rd=g_rnames[slot];
         /* re-check r1 after alloc may have evicted */
         r1=ld_tmp(lhs,out);
-        if (!strcmp(r1,r2b)) { fprintf(out,"\tmv\tt6, %s\n",r1); r1="t6"; }
+        if (!strcmp(r1,r2b)) { emit_move(out, "t6", r1); r1="t6"; }
 
         if      (!strcmp(op,"+")||!strcmp(op,"add"))
             fprintf(out,"\tadd\t%s, %s, %s\n",rd,r1,r2b);
@@ -1495,7 +1521,9 @@ void generate_text_header(FILE *out)
 
 void generate_exit(FILE *out)
 {
-    fprintf(out,"\n.Lexit:\n\tli\ta7, 10\n\tecall\n");
+    fprintf(out,"\n.Lexit:\n");
+    emit_load_imm(out, "a7", 10);
+    fprintf(out,"\tecall\n");
 }
 
 /* Stubs for per-instruction public functions (not used by main flow) */
