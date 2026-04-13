@@ -6,10 +6,8 @@ int main() {
     matrix P[3][3];
 
     T = S.T;       // symmetric transpose no-op
-    P = S.mul(S);  // symmetric self-mul upper triangle
 
     print("t:", T[0][1], T[1][0]);
-    print("p:", P[0][2], P[2][0]);
 
     return 0;
 }

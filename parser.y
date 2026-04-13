@@ -13,6 +13,7 @@
     extern int line_no;
     extern int yylex();
     void yyerror(const char *s);
+    void set_token_output(FILE *out);
 
     ASTNode* root;
 %}
@@ -694,27 +695,32 @@ ASTNode* createNode(char *type, char *value, ASTNode *left, ASTNode *right, ASTN
     return node;
 }
 
-void printIndent(int level)
+static void printIndentToFile(FILE *out, int level)
 {
     for (int i = 0; i < level; i++)
-        printf("|   ");
+        fprintf(out, "|   ");
 }
 
-void printAST(ASTNode* node, int level)
+static void printASTToFile(FILE *out, ASTNode* node, int level)
 {
     if (node == NULL)
         return;
 
-    printIndent(level);
+    printIndentToFile(out, level);
 
     if (node->value)
-        printf("|-- %s (%s)\n", node->type, node->value);
+        fprintf(out, "|-- %s (%s)\n", node->type, node->value);
     else
-        printf("|-- %s\n", node->type);
+        fprintf(out, "|-- %s\n", node->type);
 
-    printAST(node->left, level + 1);
-    printAST(node->right, level + 1);
-    printAST(node->third, level + 1);
+    printASTToFile(out, node->left, level + 1);
+    printASTToFile(out, node->right, level + 1);
+    printASTToFile(out, node->third, level + 1);
+}
+
+void printAST(ASTNode* node, int level)
+{
+    printASTToFile(stdout, node, level);
 }
 
 void yyerror(const char *s) {
@@ -725,6 +731,9 @@ int main(int argc, char **argv) {
     int parse_ok;
     int semantic_ok = 0;
     IROptLevel opt_level = IR_OPT_O1;
+    FILE *tokens_out = NULL;
+    FILE *ast_out = NULL;
+    FILE *symbol_out = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-O0") == 0) {
@@ -740,15 +749,39 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("Tokens Generated:\n");
+    tokens_out = fopen("tokens.txt", "w");
+    if (!tokens_out) {
+        perror("fopen tokens.txt");
+        return 1;
+    }
+    set_token_output(tokens_out);
+
     parse_ok = (yyparse() == 0);
+    fclose(tokens_out);
+    set_token_output(NULL);
+
     if (parse_ok) {
-        printf("Parsing completed successfully.\n");
-        printAST(root, 0);
+        ast_out = fopen("ast.txt", "w");
+        if (!ast_out) {
+            perror("fopen ast.txt");
+            return 1;
+        }
+        printASTToFile(ast_out, root, 0);
+        fclose(ast_out);
+
+        symbol_out = fopen("symbol.txt", "w");
+        if (!symbol_out) {
+            perror("fopen symbol.txt");
+            return 1;
+        }
+        fprintf(symbol_out, "Symbol Table\n");
+        fprintf(symbol_out, "------------\n");
+        semantic_set_symbol_output(symbol_out);
         semantic_ok = semantic_analysis(root);
+        semantic_set_symbol_output(NULL);
+        fclose(symbol_out);
+
         if (semantic_ok) {
-            printf("Semantic analysis completed successfully.\n");
-            printf("IR Output:\n");
             FILE *ir_out = fopen("output.ir", "w");
             if (!ir_out) {
                 perror("fopen output.ir");
@@ -756,13 +789,8 @@ int main(int argc, char **argv) {
             }
 
             generate_ir_level(root, ir_out, opt_level);
-            generate_ir_level(root, stdout, opt_level);
             fclose(ir_out);
-        } else {
-            printf("Semantic analysis failed with %d error(s).\n", semantic_error_count());
         }
-    } else {
-        printf("Parsing failed.\n");
     }
-    return 0;
+    return (parse_ok && semantic_ok) ? 0 : 1;
 }

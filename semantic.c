@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern int line_no;
+
 typedef enum SymbolType {
     SYM_INVALID = 0,
     SYM_INT,
@@ -41,6 +43,8 @@ typedef struct ExprInfo {
 
 static Scope *current_scope = NULL;
 static int semantic_errors = 0;
+static FILE *symbol_output = NULL;
+static int current_scope_depth = -1;
 
 static const char *classify_semantic_error(const char *message)
 {
@@ -117,7 +121,7 @@ static void semantic_error(const char *fmt, ...)
     va_end(args);
 
     category = classify_semantic_error(message);
-    fprintf(stderr, "Semantic error [%s]: %s\n", category, message);
+    fprintf(stderr, "Semantic error at line %d [%s]: %s\n", line_no, category, message);
 }
 
 static const char *type_name(SymbolType type)
@@ -198,6 +202,7 @@ static void enter_scope(void)
     scope->symbols = NULL;
     scope->parent = current_scope;
     current_scope = scope;
+    current_scope_depth++;
 }
 
 static void exit_scope(void)
@@ -221,6 +226,7 @@ static void exit_scope(void)
     parent = current_scope->parent;
     free(current_scope);
     current_scope = parent;
+    current_scope_depth--;
 }
 
 static Symbol *lookup_current_scope(const char *name)
@@ -267,6 +273,7 @@ static Symbol *lookup_symbol(const char *name)
 static void declare_symbol(const char *name, SymbolType type, int size, int rows, int cols)
 {
     Symbol *sym;
+    const char *kind = "invalid";
 
     if (!name) {
         return;
@@ -285,6 +292,43 @@ static void declare_symbol(const char *name, SymbolType type, int size, int rows
     sym->cols = cols;
     sym->next = current_scope->symbols;
     current_scope->symbols = sym;
+
+    if (symbol_output) {
+        switch (type) {
+            case SYM_INT:
+                kind = "int";
+                break;
+            case SYM_DECIMAL:
+                kind = "decimal";
+                break;
+            case SYM_CHAR:
+                kind = "char";
+                break;
+            case SYM_STRING:
+                kind = "string";
+                break;
+            case SYM_ARRAY:
+                kind = "array";
+                break;
+            case SYM_MATRIX:
+                kind = "matrix";
+                break;
+            default:
+                kind = "invalid";
+                break;
+        }
+
+        if (type == SYM_ARRAY) {
+            fprintf(symbol_output, "scope=%d name=%s type=%s size=%d\n",
+                    current_scope_depth, name, kind, size);
+        } else if (type == SYM_MATRIX) {
+            fprintf(symbol_output, "scope=%d name=%s type=%s rows=%d cols=%d\n",
+                    current_scope_depth, name, kind, rows, cols);
+        } else {
+            fprintf(symbol_output, "scope=%d name=%s type=%s\n",
+                    current_scope_depth, name, kind);
+        }
+    }
 }
 
 static int parse_int_literal(const char *text, long long *value)
@@ -1114,6 +1158,7 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
 int semantic_analysis(ASTNode *root_node)
 {
     semantic_errors = 0;
+    current_scope_depth = -1;
     enter_scope();
     analyze_node(root_node, 0, 0);
     exit_scope();
@@ -1123,4 +1168,9 @@ int semantic_analysis(ASTNode *root_node)
 int semantic_error_count(void)
 {
     return semantic_errors;
+}
+
+void semantic_set_symbol_output(FILE *out)
+{
+    symbol_output = out;
 }

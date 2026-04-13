@@ -3,9 +3,15 @@
 #include "cd_util.h"
 #include <stdio.h>
 int line_no = 1;
+static FILE *token_output = NULL;
 
 void print_token(const char* token_type, const char* lexeme) {
-    printf("%-20s: %s\n", token_type, lexeme);
+    FILE *out = token_output ? token_output : stdout;
+    fprintf(out, "%-20s: %s\n", token_type, lexeme);
+}
+
+void set_token_output(FILE *out) {
+    token_output = out;
 }
 %}
 
@@ -95,7 +101,7 @@ STRING      \"([^\"\\]|\\.)*\"
 
 [ \t\r]+      { /* Ignore whitespace */ }
 \n          { line_no++; }
-.           { printf("Lexical Error at line %d: %s\n", line_no, yytext); exit(1); }
+.           { fprintf(stderr, "Lexical Error at line %d: %s\n", line_no, yytext); exit(1); }
 %%
 
 int yywrap() { 

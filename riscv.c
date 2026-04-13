@@ -107,6 +107,7 @@ static int      g_max_temp = 0;
 static int      g_last_use[MAX_TEMPS + 1];
 static int      g_cur_line = 0;
 static int      g_spilled[MAX_TEMPS + 1];
+static int      g_fspilled[MAX_TEMPS + 1];
 
 typedef enum { TK_UNKNOWN = 0, TK_INT, TK_FLOAT, TK_ADDR } TempKind;
 static TempKind  g_tkind[MAX_TEMPS + 1];
@@ -303,6 +304,7 @@ static void sym_add(const char *n, SymKind k, int elems, int cols)
         /* Upgrade scalar to array/matrix if a richer decl appears later */
         if (s->kind == SYM_SCALAR && k != SYM_SCALAR) {
             s->kind = k; s->elems = elems; s->cols = cols;
+            if (k == SYM_MATRIX) s->mem_is_float = 0;
         }
         return;
     }
@@ -461,7 +463,7 @@ static void infer_temp_kinds(void)
         if (sscanf(ln,"store [t%d], t%d",&addr,&val)==2) {
             int base = (addr > 0 && addr <= MAX_TEMPS) ? g_taddr_base[addr] : -1;
             if (base >= 0 && val > 0 && val <= MAX_TEMPS) {
-                g_syms[base].mem_is_float = (g_tkind[val] == TK_FLOAT);
+                g_syms[base].mem_is_float = g_syms[base].mem_is_float || (g_tkind[val] == TK_FLOAT);
             }
             continue;
         }
@@ -874,7 +876,7 @@ static void rc_spill_slot(int slot, FILE *out)
         if (g_tkind[t] == TK_ADDR) {
             return;
         }
-        if (g_last_use[t] > g_cur_line) {
+        if (g_last_use[t] >= g_cur_line) {
             g_spilled[t] = 1;
             fprintf(out,"\tla\tt6, t_%d\n", t);
             fprintf(out,"\tsw\t%s, 0(t6)\n", g_rnames[slot]);
@@ -896,9 +898,11 @@ static void rc_flush(FILE *out)
         for (int r = 0; r < FREG_POOL; r++) {
             int t = g_fowner[r];
             if (t > 0) {
-                g_spilled[t] = 1;
-                fprintf(out,"\tla\tt6, t_%d\n", t);
-                fprintf(out,"\tfsw\t%s, 0(t6)\n", g_frnames[r]);
+                if (g_tkind[t] == TK_FLOAT) {
+                    g_fspilled[t] = 1;
+                    fprintf(out,"\tla\tt6, tf_%d\n", t);
+                    fprintf(out,"\tfsw\t%s, 0(t6)\n", g_frnames[r]);
+                }
             }
         }
     }
@@ -944,9 +948,9 @@ static int fc_evict(FILE *out)
     for (int r = 1; r < FREG_POOL; r++) if (g_flru[r] < g_flru[oldest]) oldest = r;
     if (g_fowner[oldest] > 0) {
         int t = g_fowner[oldest];
-        if (out && g_last_use[t] > g_cur_line) {
-            g_spilled[t] = 1;
-            fprintf(out,"\tla\tt6, t_%d\n", t);
+        if (out && g_tkind[t] == TK_FLOAT && g_last_use[t] >= g_cur_line) {
+            g_fspilled[t] = 1;
+            fprintf(out,"\tla\tt6, tf_%d\n", t);
             fprintf(out,"\tfsw\t%s, 0(t6)\n", g_frnames[oldest]);
         }
         g_fcache[t] = -1;
@@ -1012,7 +1016,7 @@ static const char *ld_tmp_f(int t, FILE *out)
             emit_load_imm(out, "t6", g_fconst_bits[t]);
             fprintf(out,"\tfmv.w.x\t%s, t6\n", r);
         } else {
-            fprintf(out,"\tla\tt6, t_%d\n", t);
+            fprintf(out,"\tla\tt6, tf_%d\n", t);
             fprintf(out,"\tflw\t%s, 0(t6)\n", r);
         }
         return r;
@@ -1025,6 +1029,18 @@ static const char *ld_tmp_f(int t, FILE *out)
     return r;
 }
 
+static const char *ld_tmp_f_operand(int t, const char *scratch, FILE *out)
+{
+    if (t > 0 && t <= MAX_TEMPS && g_tkind[t] == TK_FLOAT) {
+        return ld_tmp_f(t, out);
+    }
+    {
+        const char *ri = ld_tmp(t, out);
+        fprintf(out,"\tfcvt.s.w\t%s, %s\n", scratch, ri);
+    }
+    return scratch;
+}
+
 /*
  * Store register reg into temp t's .data slot.
  * Uses:  la t6, t_N  /  sw reg, 0(t6)
@@ -1032,6 +1048,7 @@ static const char *ld_tmp_f(int t, FILE *out)
  */
 static void st_tmp(int t, const char *reg, FILE *out)
 {
+    if (t > 0 && t <= MAX_TEMPS) g_spilled[t] = 1;
     fprintf(out,"\tla\tt6, t_%d\n", t);
     fprintf(out,"\tsw\t%s, 0(t6)\n", reg);
     /* pin the result in the cache */
@@ -1046,7 +1063,8 @@ static void st_tmp(int t, const char *reg, FILE *out)
 
 static void st_tmp_f(int t, const char *reg, FILE *out)
 {
-    fprintf(out,"\tla\tt6, t_%d\n", t);
+    if (t > 0 && t <= MAX_TEMPS) g_fspilled[t] = 1;
+    fprintf(out,"\tla\tt6, tf_%d\n", t);
     fprintf(out,"\tfsw\t%s, 0(t6)\n", reg);
     for (int r = 0; r < FREG_POOL; r++) {
         if (!strcmp(g_frnames[r], reg)) {
@@ -1085,7 +1103,7 @@ static void emit_one(const char *ln, FILE *out)
     if (!ln || !*ln || ln[0]=='#') return;
 
     if (!strcmp(ln,"IR_BEGIN")||!strcmp(ln,"IR_END"))
-        { fprintf(out,"\t# %s\n",ln); return; }
+        { return; }
 
     /* ── label ─────────────────────────────────────────────────── */
     if (sscanf(ln,"label L%d",&label)==1) {
@@ -1149,21 +1167,23 @@ static void emit_one(const char *ln, FILE *out)
     }
 
     /* ── decl* ──────────────────────────────────────────────────── */
-    if (!strncmp(ln,"decl",4)) { fprintf(out,"\t# %s\n",ln); return; }
+    if (!strncmp(ln,"decl",4)) { return; }
 
     /* ── store [tA], tB ─────────────────────────────────────────── */
     if (sscanf(ln,"store [t%d], t%d",&addr,&val)==2) {
         const char *ra=ld_tmp(addr,out);
-        if (g_tkind[val] == TK_FLOAT) {
-            const char *rv = ld_tmp_f(val, out);
-            fprintf(out,"\tfsw\t%s, 0(%s)\n",rv,ra);
+        /* Keep effective address in a non-cached scratch register.
+         * ld_tmp()/ld_tmp_f_operand() may reuse t-registers (and t6),
+         * so storing via ra directly can be clobbered under pressure. */
+        emit_move(out, "a5", ra);
+        int base = (addr > 0 && addr <= MAX_TEMPS) ? g_taddr_base[addr] : -1;
+        int target_is_float = (base >= 0 && base < g_nsyms && g_syms[base].mem_is_float);
+        if (g_tkind[val] == TK_FLOAT || target_is_float) {
+            const char *rv = ld_tmp_f_operand(val, "ft8", out);
+            fprintf(out,"\tfsw\t%s, 0(a5)\n",rv);
         } else {
             const char *rv=ld_tmp(val, out);
-            /* if eviction aliased them, reload addr into t6 */
-            if (!strcmp(ra,rv)) {
-                emit_move(out, "t6", ra); ra="t6";
-            }
-            fprintf(out,"\tsw\t%s, 0(%s)\n",rv,ra);
+            fprintf(out,"\tsw\t%s, 0(a5)\n",rv);
         }
         return;
     }
@@ -1187,9 +1207,9 @@ static void emit_one(const char *ln, FILE *out)
                 g_tm[def].has_const=1; g_tm[def].cval=v;
             } else {
                 if (is_simm12((long)atof(sval))) {
-                    fprintf(out,"\taddi\t%s, x0, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+                    fprintf(out,"\taddi\t%s, x0, %ld\n",r,(long)atof(sval));
                 } else {
-                    fprintf(out,"\tli\t%s, %ld\t# %s %s\n",r,(long)atof(sval),kind,sval);
+                    fprintf(out,"\tli\t%s, %ld\n",r,(long)atof(sval));
                 }
             }
         }
@@ -1245,10 +1265,9 @@ static void emit_one(const char *ln, FILE *out)
         if (g_tkind[def] == TK_FLOAT) {
             g_fconst_known[def] = g_fconst_known[src];
             if (g_fconst_known[def]) g_fconst_bits[def] = g_fconst_bits[src];
-            const char *rs=ld_tmp_f(src,out);
-            int slot=fc_alloc(def, out);
-            const char *rd=g_frnames[slot];
-            if (strcmp(rs,rd)) fprintf(out,"\tfsgnj.s\t%s, %s, %s\n",rd,rs,rs);
+            const char *rs=ld_tmp_f_operand(src, "ft8", out);
+            fprintf(out,"\tfsgnj.s\tft0, %s, %s\n",rs,rs);
+            st_tmp_f(def, "ft0", out);
         } else {
             const char *rs=ld_tmp(src,out);
             int slot=rc_alloc(def, out);
@@ -1278,7 +1297,6 @@ static void emit_one(const char *ln, FILE *out)
                 emit_load_imm(out, "t6", cols);
                 fprintf(out,"\tmul\t%s, %s, t6\n",rd,rs);
             } else {
-                fprintf(out,"\t# [warn] unknown cols(%s)\n",mname);
                 if (strcmp(rs,rd)) emit_move(out, rd, rs);
             }
             g_tm[def].has_const=0;
@@ -1313,27 +1331,26 @@ static void emit_one(const char *ln, FILE *out)
     if (sscanf(ln,"t%d = %31s t%d, t%d",&def,op,&lhs,&rhs)==4) {
         if (g_tkind[def] == TK_FLOAT) {
             g_fconst_known[def] = 0;
-            const char *r1 = ld_tmp_f(lhs,out);
-            const char *r2 = ld_tmp_f(rhs,out);
-            int slot = fc_alloc(def, out);
-            const char *rd = g_frnames[slot];
+            const char *r1 = ld_tmp_f_operand(lhs, "ft8", out);
+            const char *r2 = ld_tmp_f_operand(rhs, "ft9", out);
 
             if      (!strcmp(op,"+")||!strcmp(op,"add"))
-                fprintf(out,"\tfadd.s\t%s, %s, %s\n",rd,r1,r2);
+                fprintf(out,"\tfadd.s\tft0, %s, %s\n",r1,r2);
             else if (!strcmp(op,"-")||!strcmp(op,"sub"))
-                fprintf(out,"\tfsub.s\t%s, %s, %s\n",rd,r1,r2);
+                fprintf(out,"\tfsub.s\tft0, %s, %s\n",r1,r2);
             else if (!strcmp(op,"*")||!strcmp(op,"mul"))
-                fprintf(out,"\tfmul.s\t%s, %s, %s\n",rd,r1,r2);
+                fprintf(out,"\tfmul.s\tft0, %s, %s\n",r1,r2);
             else if (!strcmp(op,"/"))
-                fprintf(out,"\tfdiv.s\t%s, %s, %s\n",rd,r1,r2);
+                fprintf(out,"\tfdiv.s\tft0, %s, %s\n",r1,r2);
             else
-                fprintf(out,"\t# [?fbinop] %s\n",ln);
+                return;
+            st_tmp_f(def, "ft0", out);
             return;
         }
 
         if (g_tkind[lhs] == TK_FLOAT || g_tkind[rhs] == TK_FLOAT) {
-            const char *r1 = ld_tmp_f(lhs,out);
-            const char *r2 = ld_tmp_f(rhs,out);
+            const char *r1 = ld_tmp_f_operand(lhs, "ft8", out);
+            const char *r2 = ld_tmp_f_operand(rhs, "ft9", out);
             int slot = rc_alloc(def, out);
             const char *rd = g_rnames[slot];
 
@@ -1351,7 +1368,7 @@ static void emit_one(const char *ln, FILE *out)
             else if (!strcmp(op,"ge"))
                 fprintf(out,"\tfle.s\t%s, %s, %s\n",rd,r2,r1);
             else
-                fprintf(out,"\t# [?fcmp] %s\n",ln);
+                return;
             g_tm[def].has_const=0;
             return;
         }
@@ -1446,7 +1463,7 @@ static void emit_one(const char *ln, FILE *out)
         else if (!strcmp(op,"or")) {
             fprintf(out,"\tor\t%s, %s, %s\n",rd,r1,r2b);
             fprintf(out,"\tsnez\t%s, %s\n",rd,rd); }
-        else fprintf(out,"\t# [?binop] %s\n",ln);
+        else return;
 
         g_tm[def].has_const=0;
         return;
@@ -1456,24 +1473,21 @@ static void emit_one(const char *ln, FILE *out)
     if (sscanf(ln,"t%d = %31s t%d",&def,op,&src)==3) {
         if (g_tkind[def] == TK_FLOAT) {
             g_fconst_known[def] = 0;
-            const char *rs=ld_tmp_f(src,out);
-            int slot=fc_alloc(def, out);
-            const char *rd=g_frnames[slot];
-            if (!strcmp(op,"uminus"))fprintf(out,"\tfneg.s\t%s, %s\n",rd,rs);
-            else fprintf(out,"\t# [?funary] %s\n",ln);
+            const char *rs=ld_tmp_f_operand(src, "ft8", out);
+            if (!strcmp(op,"uminus"))fprintf(out,"\tfneg.s\tft0, %s\n",rs);
+            else return;
+            st_tmp_f(def, "ft0", out);
         } else {
             const char *rs=ld_tmp(src,out);
             int slot=rc_alloc(def, out);
             const char *rd=g_rnames[slot];
             if (!strcmp(op,"uminus"))fprintf(out,"\tneg\t%s, %s\n",rd,rs);
             else if (!strcmp(op,"not"))   fprintf(out,"\tseqz\t%s, %s\n",rd,rs);
-            else fprintf(out,"\t# [?unary] %s\n",ln);
+            else return;
             g_tm[def].has_const=0;
         }
         return;
     }
-
-    fprintf(out,"\t# [unhandled] %s\n",ln);
 }
 
 /* ================================================================== */
@@ -1488,25 +1502,27 @@ void generate_data_section(FILE *out)
         if (s->kind==SYM_SCALAR)
             fprintf(out,"%s:\t.word\t0\n",s->name);
         else
-            fprintf(out,"%s:\t.space\t%d\t# %d words\n",
-                    s->name,s->elems*4,s->elems);
+            fprintf(out,"%s:\t.space\t%d\n", s->name,s->elems*4);
     }
     if (g_max_temp>0) {
         int any = 0;
         for (int t=1;t<=g_max_temp;t++) {
-            if (g_spilled[t]) { any = 1; break; }
+            if (g_spilled[t] || g_fspilled[t]) { any = 1; break; }
         }
         if (any) {
-            fprintf(out,"\n\t# temporaries\n");
+            fprintf(out,"\n");
             for (int t=1;t<=g_max_temp;t++) {
                 if (g_spilled[t]) {
                     fprintf(out,"t_%d:\t.word\t0\n",t);
+                }
+                if (g_fspilled[t]) {
+                    fprintf(out,"tf_%d:\t.word\t0\n",t);
                 }
             }
         }
     }
     if (g_nstrs>0) {
-        fprintf(out,"\n\t# strings\n");
+        fprintf(out,"\n");
         for (int i=0;i<g_nstrs;i++)
             fprintf(out,"%s:\t.asciz\t\"%s\"\n",
                     g_strtab[i].label,g_strtab[i].text);
@@ -1557,6 +1573,7 @@ int generate_riscv(const char *ir_file, const char *asm_file)
 
     /* Dry-run emission to mark which temps actually spill. */
     memset(g_spilled, 0, sizeof(g_spilled));
+    memset(g_fspilled, 0, sizeof(g_fspilled));
     {
         FILE *nul = fopen("NUL", "w");
         if (nul) {
@@ -1575,9 +1592,6 @@ int generate_riscv(const char *ir_file, const char *asm_file)
     FILE *out=fopen(asm_file,"w");
     if (!out) { perror(asm_file); free_ir(); return -1; }
 
-    fprintf(out,"# RISC-V (RV32IM) — compiler project backend\n");
-    fprintf(out,"# Source IR : %s\n\n",ir_file);
-
     generate_data_section(out);
     generate_text_header(out);
 
@@ -1586,15 +1600,12 @@ int generate_riscv(const char *ir_file, const char *asm_file)
         g_cur_line = i;
         const char *ln=g_lines[i];
         if (!ln||!*ln) continue;
-        /* print IR as inline comment for readability */
-        if (ln[0]!='#') fprintf(out,"\t\t\t# %s\n",ln);
         emit_one(ln,out);
     }
 
     generate_exit(out);
     fclose(out);
     free_ir();
-    printf("RISC-V assembly written to '%s'\n",asm_file);
     return 0;
 }
 

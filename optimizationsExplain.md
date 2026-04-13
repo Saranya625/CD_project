@@ -1147,11 +1147,11 @@ c = a.mul(b);
 
 ### What it does
 
-Generates straight-line multiply-add code for each output element instead of loop control code.
+Keeps runtime `i/j` loops and emits straight-line multiply-add code only for the inner `k` accumulation.
 
 ### Why it helps
 
-For tiny matrices, loop overhead can be a big fraction of total work. Unrolling trades code size for speed.
+For tiny matrices, removing the inner-loop control overhead is often enough while keeping code size lower than fully flattening all three loops.
 
 ---
 

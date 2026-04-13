@@ -1,3 +1,5 @@
+//Wrong Det and Inverse
+
 int main() {
     matrix D[3][3] = {{2,0,0},{0,3,0},{0,0,4}};
     matrix Inv[3][3];

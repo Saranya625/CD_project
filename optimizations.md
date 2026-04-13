@@ -232,7 +232,7 @@ c = a.mul(b);
 ```
 
 **Why it helps**
-Generates straight-line arithmetic (no loop overhead) for tiny matrices.
+Keeps `i/j` loops but unrolls the inner `k` accumulation, removing one loop level for tiny matrices.
 
 ---
 
