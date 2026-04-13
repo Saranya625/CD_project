@@ -1,0 +1,12 @@
+//O2 giving error
+
+int main(){
+    array a[7] = {0,1,2,3,4,5,6};
+    int c = 0;
+    int i;
+    for(i = 0; i < 7; i++){
+        c = c + a[i];
+    }
+
+    print(c);
+}

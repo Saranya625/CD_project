@@ -1,11 +1,13 @@
 #include "ir.h"
+#include "ir_internal.h"
+#include "cd_util.h"
 
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
+struct IRContext {
     int temp_id;
     int label_id;
     int indent;
@@ -13,16 +15,25 @@ typedef struct {
     struct ArrayInfo *arrays;
     struct ConstBinding *consts;
     struct ExprCache *cse_cache;
+    struct MatExprCache *mat_cse_cache;
     int capture;
     char **lines;
     int line_count;
     int line_cap;
-} IRContext;
+    IROptLevel opt_level;
+};
 
 typedef struct MatrixInfo {
     char *name;
     int rows;
     int cols;
+    int props_known;
+    int is_zero;
+    int is_identity;
+    int is_diagonal;
+    int is_symmetric;
+    int is_upper_triangular;
+    int is_lower_triangular;
     struct MatrixInfo *next;
 } MatrixInfo;
 
@@ -58,6 +69,12 @@ typedef struct ExprCache {
     int temp;
     struct ExprCache *next;
 } ExprCache;
+
+typedef struct MatExprCache {
+    char *key;
+    char *name;
+    struct MatExprCache *next;
+} MatExprCache;
 
 typedef struct {
     ConstKind kind;
@@ -118,7 +135,7 @@ static void ir_lines_free(IRContext *ctx)
     ctx->line_cap = 0;
 }
 
-static void ir_printf(IRContext *ctx, FILE *out, const char *fmt, ...)
+void ir_printf(IRContext *ctx, FILE *out, const char *fmt, ...)
 {
     va_list args;
     va_list copy;
@@ -171,19 +188,19 @@ static void ir_printf(IRContext *ctx, FILE *out, const char *fmt, ...)
     free(tmp);
 }
 
-static int new_temp(IRContext *ctx)
+int new_temp(IRContext *ctx)
 {
     ctx->temp_id++;
     return ctx->temp_id;
 }
 
-static int new_label(IRContext *ctx)
+int new_label(IRContext *ctx)
 {
     ctx->label_id++;
     return ctx->label_id;
 }
 
-static const char *safe_str(const char *s)
+const char *safe_str(const char *s)
 {
     return s ? s : "";
 }
@@ -194,6 +211,37 @@ static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label,
 static void emit_matrix_init_list(IRContext *ctx, const char *name, ASTNode *node, int row, int *col, FILE *out);
 static void emit_matrix_init_rows(IRContext *ctx, const char *name, ASTNode *node, int *row, FILE *out);
 static void emit_matrix_init(IRContext *ctx, const char *name, ASTNode *node, FILE *out);
+static int emit_matrix_add3(IRContext *ctx, const char *dst, const char *a, const char *b, const char *c,
+                            int rows, int cols, FILE *out);
+static int emit_matrix_zero_fill(IRContext *ctx, const char *dst, int rows, int cols, FILE *out);
+static int emit_matrix_identity_fill(IRContext *ctx, const char *dst, int n, FILE *out);
+static int emit_matrix_scalar_copy(IRContext *ctx, const char *dst, const char *src, FILE *out);
+static int emit_matrix_scalar_binop(IRContext *ctx, const char *dst, const char *a, const char *b,
+                                    const char *op, FILE *out);
+static int emit_matrix_mul_inner1(IRContext *ctx, const char *dst, const char *a, const char *b,
+                                  int rows, int cols, FILE *out);
+static int emit_matrix_mul_diag_left(IRContext *ctx, const char *dst, const char *diag, const char *a,
+                                     int rows, int cols, FILE *out);
+static int emit_matrix_mul_diag_right(IRContext *ctx, const char *dst, const char *a, const char *diag,
+                                      int rows, int cols, FILE *out);
+static int emit_matrix_mul_sym_self(IRContext *ctx, const char *dst, const char *a,
+                                    int n, FILE *out);
+static int emit_matrix_transpose_inplace(IRContext *ctx, const char *name, int n, FILE *out);
+static int emit_matrix_transpose_via_temp(IRContext *ctx, const char *dst, const char *src,
+                                          int src_rows, int src_cols, int dst_rows, int dst_cols, FILE *out);
+static int emit_matrix_mul_unrolled(IRContext *ctx, const char *dst, const char *a, const char *b,
+                                    int n, FILE *out);
+static int emit_matrix_det_diag(IRContext *ctx, const char *src, int n, FILE *out);
+
+static int ir_opt_enabled(const IRContext *ctx)
+{
+    return ctx && ctx->opt_level >= IR_OPT_O1;
+}
+
+static int ir_o2_enabled(const IRContext *ctx)
+{
+    return ctx && ctx->opt_level >= IR_OPT_O2;
+}
 
 static int parse_int_value(const char *text, int *out)
 {
@@ -378,6 +426,43 @@ static void expr_cache_free(ExprCache *head)
     }
 }
 
+static void mat_cache_free(MatExprCache *head)
+{
+    while (head) {
+        MatExprCache *next = head->next;
+        free(head->key);
+        free(head->name);
+        free(head);
+        head = next;
+    }
+}
+
+static MatExprCache *mat_cache_find(MatExprCache *head, const char *key)
+{
+    while (head) {
+        if (strcmp(head->key, key) == 0) {
+            return head;
+        }
+        head = head->next;
+    }
+    return NULL;
+}
+
+static void mat_cache_add(MatExprCache **head, char *key, const char *name)
+{
+    MatExprCache *node;
+
+    if (!head || !key || !name) {
+        free(key);
+        return;
+    }
+    node = malloc(sizeof(MatExprCache));
+    node->key = key;
+    node->name = strdup(name);
+    node->next = *head;
+    *head = node;
+}
+
 static ExprCache *expr_cache_find(ExprCache *head, const char *key)
 {
     while (head) {
@@ -410,6 +495,8 @@ static void cse_clear(IRContext *ctx)
     }
     expr_cache_free(ctx->cse_cache);
     ctx->cse_cache = NULL;
+    mat_cache_free(ctx->mat_cse_cache);
+    ctx->mat_cse_cache = NULL;
 }
 
 static int cse_key_mentions(const char *key, const char *name)
@@ -712,8 +799,65 @@ static void add_matrix_info(IRContext *ctx, const char *name, int rows, int cols
     info->name = strdup(name);
     info->rows = rows;
     info->cols = cols;
+    info->props_known = 0;
+    info->is_zero = 0;
+    info->is_identity = 0;
+    info->is_diagonal = 0;
+    info->is_symmetric = 0;
+    info->is_upper_triangular = 0;
+    info->is_lower_triangular = 0;
     info->next = ctx->matrices;
     ctx->matrices = info;
+}
+
+static char *mat_expr_key(const char *op, const char *a, const char *b)
+{
+    if (!op || !a || !b) {
+        return NULL;
+    }
+    return str_printf("mop:%s(id:%s,id:%s)", op, a, b);
+}
+
+static char *mat_unary_key(const char *op, const char *a)
+{
+    if (!op || !a) {
+        return NULL;
+    }
+    return str_printf("mop:%s(id:%s)", op, a);
+}
+
+static void mat_cache_invalidate_name(IRContext *ctx, const char *name)
+{
+    MatExprCache *cur;
+    MatExprCache *prev;
+
+    if (!ctx || !name) {
+        return;
+    }
+    prev = NULL;
+    cur = ctx->mat_cse_cache;
+    while (cur) {
+        MatExprCache *next = cur->next;
+        if (cse_key_mentions(cur->key, name)) {
+            if (prev) {
+                prev->next = next;
+            } else {
+                ctx->mat_cse_cache = next;
+            }
+            free(cur->key);
+            free(cur->name);
+            free(cur);
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
+}
+
+static void matrix_invalidate_name(IRContext *ctx, const char *name)
+{
+    mat_cache_invalidate_name(ctx, name);
+    cse_invalidate_name(ctx, name);
 }
 
 static void add_array_info(IRContext *ctx, const char *name, int size)
@@ -747,6 +891,69 @@ static MatrixInfo *find_matrix_info(IRContext *ctx, const char *name)
         info = info->next;
     }
     return NULL;
+}
+
+static void matrix_props_set(MatrixInfo *info, int known, int is_zero, int is_identity, int is_diagonal,
+                             int is_symmetric, int is_upper_triangular, int is_lower_triangular)
+{
+    if (!info) {
+        return;
+    }
+    info->props_known = known;
+    info->is_zero = is_zero;
+    info->is_identity = is_identity;
+    info->is_diagonal = is_diagonal;
+    info->is_symmetric = is_symmetric;
+    info->is_upper_triangular = is_upper_triangular;
+    info->is_lower_triangular = is_lower_triangular;
+}
+
+static void matrix_props_unknown(MatrixInfo *info)
+{
+    matrix_props_set(info, 0, 0, 0, 0, 0, 0, 0);
+}
+
+static void matrix_props_copy(MatrixInfo *dst, const MatrixInfo *src)
+{
+    if (!dst) {
+        return;
+    }
+    if (src && src->props_known) {
+        matrix_props_set(dst, 1, src->is_zero, src->is_identity, src->is_diagonal,
+                         src->is_symmetric, src->is_upper_triangular, src->is_lower_triangular);
+        return;
+    }
+    matrix_props_unknown(dst);
+}
+
+static int matrix_is_zero(const MatrixInfo *info)
+{
+    return info && info->props_known && info->is_zero;
+}
+
+static int matrix_is_identity(const MatrixInfo *info)
+{
+    return info && info->props_known && info->is_identity;
+}
+
+static int matrix_is_diagonal(const MatrixInfo *info)
+{
+    return info && info->props_known && info->is_diagonal;
+}
+
+static int matrix_is_symmetric(const MatrixInfo *info)
+{
+    return info && info->props_known && info->is_symmetric;
+}
+
+static int matrix_is_upper_triangular(const MatrixInfo *info)
+{
+    return info && info->props_known && info->is_upper_triangular;
+}
+
+static int matrix_is_lower_triangular(const MatrixInfo *info)
+{
+    return info && info->props_known && info->is_lower_triangular;
 }
 
 static ArrayInfo *find_array_info(IRContext *ctx, const char *name)
@@ -1255,7 +1462,7 @@ static int emit_array_elem_addr(IRContext *ctx, const char *name, int idx_temp, 
     int addr = new_temp(ctx);
 
     ir_printf(ctx, out, "t%d = addr %s", base, safe_str(name));
-    ir_printf(ctx, out, "t%d = mul t%d, 1", off, idx_temp);
+    ir_printf(ctx, out, "t%d = mul t%d, 4", off, idx_temp);
     ir_printf(ctx, out, "t%d = add t%d, t%d", addr, base, off);
     return addr;
 }
@@ -1273,6 +1480,11 @@ static int emit_matrix_add_sub(IRContext *ctx, const char *dst, const char *a, c
     int one;
     int rows_const;
     int cols_const;
+    int four;
+    int base_a;
+    int base_b;
+    int base_dst;
+    int cols_bytes;
     int row_label;
     int row_end_label;
     int col_label;
@@ -1302,6 +1514,17 @@ static int emit_matrix_add_sub(IRContext *ctx, const char *dst, const char *a, c
     ir_printf(ctx, out, "t%d = const int 1", one);
     ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
     ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+
+    base_a = new_temp(ctx);
+    base_b = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_b, safe_str(b));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
 
     ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
     row_label = new_label(ctx);
@@ -1329,7 +1552,12 @@ static int emit_matrix_add_sub(IRContext *ctx, const char *dst, const char *a, c
 
     {
         int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int row_base_b = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
         int col_val = new_temp(ctx);
+        int col_off = new_temp(ctx);
         int addr_a;
         int addr_b;
         int addr_dst;
@@ -1338,11 +1566,20 @@ static int emit_matrix_add_sub(IRContext *ctx, const char *dst, const char *a, c
         int val_out;
 
         ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
-        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_b, base_b, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
 
-        addr_a = emit_matrix_elem_addr(ctx, a, row_val, col_val, out);
-        addr_b = emit_matrix_elem_addr(ctx, b, row_val, col_val, out);
-        addr_dst = emit_matrix_elem_addr(ctx, dst, row_val, col_val, out);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        addr_a = new_temp(ctx);
+        addr_b = new_temp(ctx);
+        addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_b, row_base_b, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
 
         val_a = new_temp(ctx);
         val_b = new_temp(ctx);
@@ -1388,6 +1625,10 @@ static int emit_matrix_copy(IRContext *ctx, const char *dst, const char *src, in
     int one;
     int rows_const;
     int cols_const;
+    int four;
+    int cols_bytes;
+    int base_src;
+    int base_dst;
     int row_label;
     int row_end_label;
     int col_label;
@@ -1417,6 +1658,15 @@ static int emit_matrix_copy(IRContext *ctx, const char *dst, const char *src, in
     ir_printf(ctx, out, "t%d = const int 1", one);
     ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
     ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+
+    base_src = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_src, safe_str(src));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
 
     ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
     row_label = new_label(ctx);
@@ -1444,16 +1694,27 @@ static int emit_matrix_copy(IRContext *ctx, const char *dst, const char *src, in
 
     {
         int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_src = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
         int col_val = new_temp(ctx);
+        int col_off = new_temp(ctx);
         int addr_src;
         int addr_dst;
         int val_src;
 
         ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
-        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_src, base_src, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
 
-        addr_src = emit_matrix_elem_addr(ctx, src, row_val, col_val, out);
-        addr_dst = emit_matrix_elem_addr(ctx, dst, row_val, col_val, out);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        addr_src = new_temp(ctx);
+        addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_src, row_base_src, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
 
         val_src = new_temp(ctx);
         ir_printf(ctx, out, "t%d = load [t%d]", val_src, addr_src);
@@ -1503,6 +1764,12 @@ static int emit_matrix_mul(IRContext *ctx, const char *dst, const char *a, const
     int rows_const;
     int inner_const;
     int cols_const;
+    int four;
+    int inner_bytes;
+    int cols_bytes;
+    int base_a;
+    int base_b;
+    int base_dst;
     int row_label;
     int row_end_label;
     int col_label;
@@ -1547,6 +1814,19 @@ static int emit_matrix_mul(IRContext *ctx, const char *dst, const char *a, const
     ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
     ir_printf(ctx, out, "t%d = const int %d", inner_const, inner);
     ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    inner_bytes = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", inner_bytes, inner_const, four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+
+    base_a = new_temp(ctx);
+    base_b = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_b, safe_str(b));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
 
     ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
     row_label = new_label(ctx);
@@ -1589,8 +1869,14 @@ static int emit_matrix_mul(IRContext *ctx, const char *dst, const char *a, const
         int row_val = new_temp(ctx);
         int col_val = new_temp(ctx);
         int k_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int col_off = new_temp(ctx);
+        int k_off;
         int addr_a;
         int addr_b;
+        int b_row_off;
+        int b_off;
         int val_a;
         int val_b;
         int mul_val;
@@ -1598,11 +1884,26 @@ static int emit_matrix_mul(IRContext *ctx, const char *dst, const char *a, const
         int acc_next;
 
         ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, inner_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+
         ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
         ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
 
-        addr_a = emit_matrix_elem_addr(ctx, a, row_val, k_val, out);
-        addr_b = emit_matrix_elem_addr(ctx, b, k_val, col_val, out);
+        k_off = new_temp(ctx);
+        addr_a = new_temp(ctx);
+        b_row_off = new_temp(ctx);
+        b_off = new_temp(ctx);
+        addr_b = new_temp(ctx);
+
+        ir_printf(ctx, out, "t%d = * t%d, t%d", k_off, k_val, four);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, k_off);
+
+        ir_printf(ctx, out, "t%d = * t%d, t%d", b_row_off, k_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", b_off, b_row_off, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_b, base_b, b_off);
 
         val_a = new_temp(ctx);
         val_b = new_temp(ctx);
@@ -1632,13 +1933,21 @@ static int emit_matrix_mul(IRContext *ctx, const char *dst, const char *a, const
         int row_val = new_temp(ctx);
         int col_val = new_temp(ctx);
         int acc_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_off = new_temp(ctx);
         int addr_dst;
 
         ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+
         ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
         ir_printf(ctx, out, "t%d = load %s", acc_val, acc_var);
 
-        addr_dst = emit_matrix_elem_addr(ctx, dst, row_val, col_val, out);
+        addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
         ir_printf(ctx, out, "store [t%d], t%d", addr_dst, acc_val);
     }
 
@@ -1677,6 +1986,11 @@ static int emit_matrix_transpose(IRContext *ctx, const char *dst, const char *sr
     int one;
     int rows_const;
     int cols_const;
+    int four;
+    int src_cols_bytes;
+    int dst_cols_bytes;
+    int base_src;
+    int base_dst;
     int row_label;
     int row_end_label;
     int col_label;
@@ -1706,6 +2020,22 @@ static int emit_matrix_transpose(IRContext *ctx, const char *dst, const char *sr
     ir_printf(ctx, out, "t%d = const int 1", one);
     ir_printf(ctx, out, "t%d = const int %d", rows_const, dst_rows);
     ir_printf(ctx, out, "t%d = const int %d", cols_const, dst_cols);
+    four = new_temp(ctx);
+    src_cols_bytes = new_temp(ctx);
+    dst_cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    /* src cols == dst_rows, dst cols == dst_cols */
+    {
+        int src_cols_const = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = const int %d", src_cols_const, dst_rows);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", src_cols_bytes, src_cols_const, four);
+    }
+    ir_printf(ctx, out, "t%d = * t%d, t%d", dst_cols_bytes, cols_const, four);
+
+    base_src = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_src, safe_str(src));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
 
     ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
     row_label = new_label(ctx);
@@ -1734,15 +2064,32 @@ static int emit_matrix_transpose(IRContext *ctx, const char *dst, const char *sr
     {
         int row_val = new_temp(ctx);
         int col_val = new_temp(ctx);
+        int row_off_dst = new_temp(ctx);
+        int col_off_src = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_base_src = new_temp(ctx);
         int addr_src;
         int addr_dst;
         int val_src;
 
         ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
-        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_dst, row_val, dst_cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off_dst);
 
-        addr_src = emit_matrix_elem_addr(ctx, src, col_val, row_val, out);
-        addr_dst = emit_matrix_elem_addr(ctx, dst, row_val, col_val, out);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off_src, col_val, src_cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_base_src, base_src, col_off_src);
+
+        addr_src = new_temp(ctx);
+        addr_dst = new_temp(ctx);
+        {
+            int row_off_src = new_temp(ctx);
+            int col_off_dst = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_src, row_val, four);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", col_off_dst, col_val, four);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_src, col_base_src, row_off_src);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off_dst);
+        }
 
         val_src = new_temp(ctx);
         ir_printf(ctx, out, "t%d = load [t%d]", val_src, addr_src);
@@ -1770,6 +2117,27 @@ static int emit_matrix_transpose(IRContext *ctx, const char *dst, const char *sr
     ir_printf(ctx, out, "label L%d", row_end_label);
 
     return 1;
+}
+
+static int emit_matrix_transpose_via_temp(IRContext *ctx, const char *dst, const char *src,
+                                          int src_rows, int src_cols, int dst_rows, int dst_cols, FILE *out)
+{
+    int tmp_id;
+    char tmp_name[32];
+
+    if (!ctx || !dst || !src || src_rows <= 0 || src_cols <= 0 || dst_rows <= 0 || dst_cols <= 0) {
+        return 0;
+    }
+
+    tmp_id = new_temp(ctx);
+    snprintf(tmp_name, sizeof(tmp_name), "mat_tr_tmp%d", tmp_id);
+    ir_printf(ctx, out, "decl_matrix %s, %d, %d", tmp_name, src_rows, src_cols);
+    add_matrix_info(ctx, tmp_name, src_rows, src_cols);
+
+    if (!emit_matrix_copy(ctx, tmp_name, src, src_rows, src_cols, out)) {
+        return 0;
+    }
+    return emit_matrix_transpose(ctx, dst, tmp_name, dst_rows, dst_cols, out);
 }
 
 static int emit_matrix_det_2x2(IRContext *ctx, const char *src, FILE *out)
@@ -1821,6 +2189,32 @@ static int emit_matrix_det_2x2(IRContext *ctx, const char *src, FILE *out)
     ir_printf(ctx, out, "t%d = - t%d, t%d", det, mul_ad, mul_bc);
 
     return det;
+}
+
+static int emit_matrix_det_diag(IRContext *ctx, const char *src, int n, FILE *out)
+{
+    int acc;
+
+    if (!src || n <= 0) {
+        return -1;
+    }
+    acc = emit_const(ctx, "int", "1", out);
+    for (int i = 0; i < n; i++) {
+        char ibuf[16];
+        int it;
+        int addr;
+        int val;
+        int next;
+        snprintf(ibuf, sizeof(ibuf), "%d", i);
+        it = emit_const(ctx, "int", ibuf, out);
+        addr = emit_matrix_elem_addr(ctx, src, it, it, out);
+        val = new_temp(ctx);
+        next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load [t%d]", val, addr);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", next, acc, val);
+        acc = next;
+    }
+    return acc;
 }
 
 static int emit_matrix_det(IRContext *ctx, const char *src, int n, FILE *out)
@@ -2025,7 +2419,6 @@ static int emit_matrix_det(IRContext *ctx, const char *src, int n, FILE *out)
             int col_val_inner;
             int mod_val;
             int is_odd;
-            int even_label;
             int det_cur;
             int det_next;
 
@@ -2040,16 +2433,19 @@ static int emit_matrix_det(IRContext *ctx, const char *src, int n, FILE *out)
 
             mod_val = new_temp(ctx);
             is_odd = new_temp(ctx);
-            ir_printf(ctx, out, "t%d = % t%d, t%d", mod_val, col_val_inner, two);
-            ir_printf(ctx, out, "t%d = eq t%d, t%d", is_odd, mod_val, one);
-            even_label = new_label(ctx);
-            ir_printf(ctx, out, "ifz t%d goto L%d", is_odd, even_label);
             {
-                int neg = new_temp(ctx);
-                ir_printf(ctx, out, "t%d = uminus t%d", neg, term);
-                term = neg;
+                int sign_scale = new_temp(ctx);
+                int sign_factor = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = %% t%d, t%d", mod_val, col_val_inner, two);
+                ir_printf(ctx, out, "t%d = eq t%d, t%d", is_odd, mod_val, one);
+                ir_printf(ctx, out, "t%d = * t%d, t%d", sign_scale, is_odd, two);
+                ir_printf(ctx, out, "t%d = - t%d, t%d", sign_factor, one, sign_scale);
+                {
+                    int signed_term = new_temp(ctx);
+                    ir_printf(ctx, out, "t%d = * t%d, t%d", signed_term, term, sign_factor);
+                    term = signed_term;
+                }
             }
-            ir_printf(ctx, out, "label L%d", even_label);
 
             det_cur = new_temp(ctx);
             det_next = new_temp(ctx);
@@ -2076,6 +2472,29 @@ static int emit_matrix_det(IRContext *ctx, const char *src, int n, FILE *out)
     }
 }
 
+static void emit_safe_div(IRContext *ctx, int dst, int num, int den, FILE *out)
+{
+    int zero = new_temp(ctx);
+    int one = new_temp(ctx);
+    int num_f = new_temp(ctx);
+    int den_f = new_temp(ctx);
+    int is_zero = new_temp(ctx);
+    int nonzero_label = new_label(ctx);
+    int end_label = new_label(ctx);
+
+    ir_printf(ctx, out, "t%d = const decimal 0.0", zero);
+    ir_printf(ctx, out, "t%d = const decimal 1.0", one);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", num_f, num, one);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", den_f, den, one);
+    ir_printf(ctx, out, "t%d = eq t%d, t%d", is_zero, den_f, zero);
+    ir_printf(ctx, out, "ifz t%d goto L%d", is_zero, nonzero_label);
+    ir_printf(ctx, out, "t%d = const decimal 0.0", dst);
+    ir_printf(ctx, out, "goto L%d", end_label);
+    ir_printf(ctx, out, "label L%d", nonzero_label);
+    ir_printf(ctx, out, "t%d = / t%d, t%d", dst, num_f, den_f);
+    ir_printf(ctx, out, "label L%d", end_label);
+}
+
 static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src, int n, FILE *out)
 {
     int i_var_id;
@@ -2089,6 +2508,8 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
     int r_addr;
     int zero;
     int one;
+    int zero_dec;
+    int one_dec;
     int n_const;
     int i_label;
     int i_end_label;
@@ -2131,9 +2552,13 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
 
     zero = new_temp(ctx);
     one = new_temp(ctx);
+    zero_dec = new_temp(ctx);
+    one_dec = new_temp(ctx);
     n_const = new_temp(ctx);
     ir_printf(ctx, out, "t%d = const int 0", zero);
     ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const decimal 0.0", zero_dec);
+    ir_printf(ctx, out, "t%d = const decimal 1.0", one_dec);
     ir_printf(ctx, out, "t%d = const int %d", n_const, n);
 
     ir_printf(ctx, out, "store [t%d], t%d", i_addr, zero);
@@ -2172,11 +2597,11 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
         ir_printf(ctx, out, "t%d = eq t%d, t%d", eq, i_val, j_val);
         ir_printf(ctx, out, "ifz t%d goto L%d", eq, set_one_label);
         addr_dst = emit_matrix_elem_addr(ctx, dst, i_val, j_val, out);
-        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, one);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, one_dec);
         ir_printf(ctx, out, "goto L%d", after_set_label);
         ir_printf(ctx, out, "label L%d", set_one_label);
         addr_dst = emit_matrix_elem_addr(ctx, dst, i_val, j_val, out);
-        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, zero);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, zero_dec);
         ir_printf(ctx, out, "label L%d", after_set_label);
     }
     {
@@ -2215,11 +2640,17 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
         int i_val = new_temp(ctx);
         int addr_pivot;
         int pivot;
+        int inv_pivot;
+        int one_val;
 
         ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
         addr_pivot = emit_matrix_elem_addr(ctx, a_name, i_val, i_val, out);
         pivot = new_temp(ctx);
         ir_printf(ctx, out, "t%d = load [t%d]", pivot, addr_pivot);
+        one_val = new_temp(ctx);
+        inv_pivot = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = const decimal 1.0", one_val);
+        emit_safe_div(ctx, inv_pivot, one_val, pivot, out);
 
         ir_printf(ctx, out, "store [t%d], t%d", j_addr, zero);
         j_label = new_label(ctx);
@@ -2238,6 +2669,8 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             int addr_inv;
             int val_a;
             int val_inv;
+            int val_a_f;
+            int val_inv_f;
             int new_a;
             int new_inv;
 
@@ -2246,12 +2679,16 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             addr_inv = emit_matrix_elem_addr(ctx, dst, i_val, j_val, out);
             val_a = new_temp(ctx);
             val_inv = new_temp(ctx);
+            val_a_f = new_temp(ctx);
+            val_inv_f = new_temp(ctx);
             new_a = new_temp(ctx);
             new_inv = new_temp(ctx);
             ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
             ir_printf(ctx, out, "t%d = load [t%d]", val_inv, addr_inv);
-            ir_printf(ctx, out, "t%d = / t%d, t%d", new_a, val_a, pivot);
-            ir_printf(ctx, out, "t%d = / t%d, t%d", new_inv, val_inv, pivot);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_a_f, val_a, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_inv_f, val_inv, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", new_a, val_a_f, inv_pivot);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", new_inv, val_inv_f, inv_pivot);
             ir_printf(ctx, out, "store [t%d], t%d", addr_a, new_a);
             ir_printf(ctx, out, "store [t%d], t%d", addr_inv, new_inv);
         }
@@ -2297,14 +2734,18 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
     {
         int i_val = new_temp(ctx);
         int r_val = new_temp(ctx);
-        int addr_factor;
         int factor;
+        int factor_f;
 
         ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
         ir_printf(ctx, out, "t%d = load %s", r_val, r_var);
-        addr_factor = emit_matrix_elem_addr(ctx, a_name, r_val, i_val, out);
-        factor = new_temp(ctx);
-        ir_printf(ctx, out, "t%d = load [t%d]", factor, addr_factor);
+        {
+            int addr_factor = emit_matrix_elem_addr(ctx, a_name, r_val, i_val, out);
+            factor = new_temp(ctx);
+            factor_f = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load [t%d]", factor, addr_factor);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", factor_f, factor, one_dec);
+        }
 
         ir_printf(ctx, out, "store [t%d], t%d", j_addr, zero);
         j_label = new_label(ctx);
@@ -2327,6 +2768,10 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             int val_a_i;
             int val_inv_r;
             int val_inv_i;
+            int val_a_r_f;
+            int val_a_i_f;
+            int val_inv_r_f;
+            int val_inv_i_f;
             int mul_a;
             int mul_inv;
             int new_a;
@@ -2342,6 +2787,10 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             val_a_i = new_temp(ctx);
             val_inv_r = new_temp(ctx);
             val_inv_i = new_temp(ctx);
+            val_a_r_f = new_temp(ctx);
+            val_a_i_f = new_temp(ctx);
+            val_inv_r_f = new_temp(ctx);
+            val_inv_i_f = new_temp(ctx);
             mul_a = new_temp(ctx);
             mul_inv = new_temp(ctx);
             new_a = new_temp(ctx);
@@ -2352,10 +2801,15 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
             ir_printf(ctx, out, "t%d = load [t%d]", val_inv_r, addr_inv_r);
             ir_printf(ctx, out, "t%d = load [t%d]", val_inv_i, addr_inv_i);
 
-            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_a, factor, val_a_i);
-            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_inv, factor, val_inv_i);
-            ir_printf(ctx, out, "t%d = - t%d, t%d", new_a, val_a_r, mul_a);
-            ir_printf(ctx, out, "t%d = - t%d, t%d", new_inv, val_inv_r, mul_inv);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_a_r_f, val_a_r, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_a_i_f, val_a_i, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_inv_r_f, val_inv_r, one_dec);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_inv_i_f, val_inv_i, one_dec);
+
+            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_a, factor_f, val_a_i_f);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_inv, factor_f, val_inv_i_f);
+            ir_printf(ctx, out, "t%d = - t%d, t%d", new_a, val_a_r_f, mul_a);
+            ir_printf(ctx, out, "t%d = - t%d, t%d", new_inv, val_inv_r_f, mul_inv);
             ir_printf(ctx, out, "store [t%d], t%d", addr_a_r, new_a);
             ir_printf(ctx, out, "store [t%d], t%d", addr_inv_r, new_inv);
         }
@@ -2604,7 +3058,7 @@ static int emit_lvalue_addr(IRContext *ctx, ASTNode *node, FILE *out)
         int off = new_temp(ctx);
         int addr = new_temp(ctx);
         ir_printf(ctx, out, "t%d = addr %s", base, safe_str(node->value));
-        ir_printf(ctx, out, "t%d = mul t%d, 1", off, idx);
+        ir_printf(ctx, out, "t%d = mul t%d, 4", off, idx);
         ir_printf(ctx, out, "t%d = add t%d, t%d", addr, base, off);
         return addr;
     }
@@ -2619,7 +3073,7 @@ static int emit_lvalue_addr(IRContext *ctx, ASTNode *node, FILE *out)
         ir_printf(ctx, out, "t%d = addr %s", base, safe_str(node->value));
         ir_printf(ctx, out, "t%d = mul t%d, cols(%s)", row_off, r, safe_str(node->value));
         ir_printf(ctx, out, "t%d = add t%d, t%d", col_off, row_off, c);
-        ir_printf(ctx, out, "t%d = mul t%d, 1", off, col_off);
+        ir_printf(ctx, out, "t%d = mul t%d, 4", off, col_off);
         ir_printf(ctx, out, "t%d = add t%d, t%d", addr, base, off);
         return addr;
     }
@@ -2644,7 +3098,7 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
             }
         }
     }
-    if (eval_const_expr(ctx, node, &folded)) {
+    if (ir_opt_enabled(ctx) && eval_const_expr(ctx, node, &folded)) {
         int temp = emit_const_value(ctx, &folded, out);
         if (cse_enabled && cache && key && temp >= 0) {
             expr_cache_add(cache, key, temp);
@@ -2720,8 +3174,8 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
         strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0) {
         ConstVal left_val;
         ConstVal right_val;
-        int left_is_const = eval_const_expr(ctx, node->left, &left_val);
-        int right_is_const = eval_const_expr(ctx, node->right, &right_val);
+        int left_is_const = ir_opt_enabled(ctx) && eval_const_expr(ctx, node->left, &left_val);
+        int right_is_const = ir_opt_enabled(ctx) && eval_const_expr(ctx, node->right, &right_val);
 
         if ((strcmp(node->type, "+") == 0 || strcmp(node->type, "*") == 0) &&
             left_is_const && !right_is_const) {
@@ -2862,7 +3316,16 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
         if (strcmp(node->type, "det") == 0 && node->left && strcmp(node->left->type, "id") == 0) {
             MatrixInfo *info = find_matrix_info(ctx, node->left->value);
             if (info && info->rows > 0 && info->cols > 0 && info->rows == info->cols) {
-                int det_val = emit_matrix_det(ctx, node->left->value, info->rows, out);
+                int det_val = -1;
+                if (matrix_is_identity(info)) {
+                    det_val = emit_const(ctx, "int", "1", out);
+                } else if (matrix_is_diagonal(info) ||
+                           matrix_is_upper_triangular(info) ||
+                           matrix_is_lower_triangular(info)) {
+                    det_val = emit_matrix_det_diag(ctx, node->left->value, info->rows, out);
+                } else {
+                    det_val = emit_matrix_det(ctx, node->left->value, info->rows, out);
+                }
                 if (det_val >= 0) {
                     if (cse_enabled && cache && key) {
                         expr_cache_add(cache, key, det_val);
@@ -2958,7 +3421,7 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
 
 static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
 {
-    return emit_expr_internal(ctx, node, out, &ctx->cse_cache, 1);
+    return emit_expr_internal(ctx, node, out, &ctx->cse_cache, ir_opt_enabled(ctx));
 }
 
 static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
@@ -2979,6 +3442,33 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
         ArrayInfo *lhs_arr = find_array_info(ctx, node->value);
         ASTNode *rhs_node = node->right ? node->right : node->left;
         if (lhs_info && rhs_node && rhs_node->type) {
+            if (strcmp(rhs_node->type, "transpose") == 0 &&
+                rhs_node->left && rhs_node->left->type &&
+                strcmp(rhs_node->left->type, "transpose") == 0) {
+                const char *src_name = (rhs_node->left->left && strcmp(rhs_node->left->left->type, "id") == 0)
+                                        ? rhs_node->left->left->value : NULL;
+                MatrixInfo *src_info = find_matrix_info(ctx, src_name);
+                int rows = lhs_info->rows;
+                int cols = lhs_info->cols;
+                if (src_info && (rows <= 0 || cols <= 0)) {
+                    rows = src_info->rows;
+                    cols = src_info->cols;
+                }
+                if (ir_opt_enabled(ctx) &&
+                    src_info && src_name && strcmp(node->value, src_name) == 0 &&
+                    rows > 0 && cols > 0 && rows == cols) {
+                    if (emit_matrix_transpose_inplace(ctx, node->value, rows, out)) {
+                        matrix_props_copy(lhs_info, src_info);
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                }
+                if (src_info && emit_matrix_copy(ctx, node->value, src_name, rows, cols, out)) {
+                    matrix_props_copy(lhs_info, src_info);
+                    matrix_invalidate_name(ctx, node->value);
+                    return;
+                }
+            }
             if (strcmp(rhs_node->type, "transpose") == 0) {
                 const char *src_name = (rhs_node->left && strcmp(rhs_node->left->type, "id") == 0) ? rhs_node->left->value : NULL;
                 MatrixInfo *src_info = find_matrix_info(ctx, src_name);
@@ -2988,8 +3478,61 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     rows = src_info->cols;
                     cols = src_info->rows;
                 }
+                if (ir_opt_enabled(ctx) &&
+                    src_info && src_name && strcmp(node->value, src_name) == 0 &&
+                    rows > 0 && cols > 0 && rows == cols) {
+                    if (emit_matrix_transpose_inplace(ctx, node->value, rows, out)) {
+                        if (src_info->props_known) {
+                            matrix_props_set(lhs_info, 1, src_info->is_zero, src_info->is_identity, src_info->is_diagonal,
+                                             src_info->is_symmetric, src_info->is_lower_triangular, src_info->is_upper_triangular);
+                        } else {
+                            matrix_props_unknown(lhs_info);
+                        }
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                }
+                if (ir_opt_enabled(ctx) && src_info && rows == 1 && cols == 1) {
+                    if (emit_matrix_scalar_copy(ctx, node->value, src_name, out)) {
+                        matrix_props_copy(lhs_info, src_info);
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                }
+                if (ir_opt_enabled(ctx) && src_info && matrix_is_symmetric(src_info)) {
+                    if (src_name && strcmp(node->value, src_name) == 0) {
+                        matrix_props_copy(lhs_info, src_info);
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                    if (emit_matrix_copy(ctx, node->value, src_name, rows, cols, out)) {
+                        matrix_props_copy(lhs_info, src_info);
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                }
+                if (src_info && src_name && strcmp(node->value, src_name) == 0) {
+                    if (emit_matrix_transpose_via_temp(ctx, node->value, src_name,
+                                                      src_info->rows, src_info->cols,
+                                                      rows, cols, out)) {
+                        if (src_info->props_known) {
+                            matrix_props_set(lhs_info, 1, src_info->is_zero, src_info->is_identity, src_info->is_diagonal,
+                                             src_info->is_symmetric, src_info->is_lower_triangular, src_info->is_upper_triangular);
+                        } else {
+                            matrix_props_unknown(lhs_info);
+                        }
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                }
                 if (src_info && emit_matrix_transpose(ctx, node->value, src_name, rows, cols, out)) {
-                    cse_invalidate_name(ctx, node->value);
+                    if (src_info->props_known) {
+                        matrix_props_set(lhs_info, 1, src_info->is_zero, src_info->is_identity, src_info->is_diagonal,
+                                         src_info->is_symmetric, src_info->is_lower_triangular, src_info->is_upper_triangular);
+                    } else {
+                        matrix_props_unknown(lhs_info);
+                    }
+                    matrix_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -2997,30 +3540,275 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                 const char *src_name = (rhs_node->left && strcmp(rhs_node->left->type, "id") == 0) ? rhs_node->left->value : NULL;
                 MatrixInfo *src_info = find_matrix_info(ctx, src_name);
                 if (src_info && src_info->rows > 0 && src_info->cols > 0 && src_info->rows == src_info->cols) {
+                    char *inv_key = NULL;
+                    if (ir_opt_enabled(ctx) && src_name) {
+                        inv_key = mat_unary_key("inv", src_name);
+                        if (inv_key) {
+                            MatExprCache *hit = mat_cache_find(ctx->mat_cse_cache, inv_key);
+                            if (hit && hit->name) {
+                                MatrixInfo *cached_info = find_matrix_info(ctx, hit->name);
+                                if (strcmp(hit->name, node->value) == 0) {
+                                    matrix_props_copy(lhs_info, cached_info);
+                                    matrix_invalidate_name(ctx, node->value);
+                                    free(inv_key);
+                                    return;
+                                }
+                                if (emit_matrix_copy(ctx, node->value, hit->name, src_info->rows, src_info->cols, out)) {
+                                    matrix_props_copy(lhs_info, cached_info);
+                                    matrix_invalidate_name(ctx, node->value);
+                                    free(inv_key);
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     if (emit_matrix_inverse(ctx, node->value, src_name, src_info->rows, out)) {
-                        cse_invalidate_name(ctx, node->value);
+                        matrix_props_unknown(lhs_info);
+                        if (ir_opt_enabled(ctx) && inv_key) {
+                            mat_cache_add(&ctx->mat_cse_cache, inv_key, node->value);
+                            inv_key = NULL;
+                        }
+                        matrix_invalidate_name(ctx, node->value);
                         return;
                     }
+                    free(inv_key);
                 }
             }
             if (strcmp(rhs_node->type, "matadd") == 0 || strcmp(rhs_node->type, "matsub") == 0 ||
                 strcmp(rhs_node->type, "matmul") == 0) {
+                if (ir_opt_enabled(ctx) &&
+                    strcmp(rhs_node->type, "matadd") == 0 &&
+                    rhs_node->left && rhs_node->left->type &&
+                    strcmp(rhs_node->left->type, "matadd") == 0) {
+                    ASTNode *l1 = rhs_node->left->left;
+                    ASTNode *l2 = rhs_node->left->right;
+                    ASTNode *r = rhs_node->right;
+                    const char *n1 = (l1 && strcmp(l1->type, "id") == 0) ? l1->value : NULL;
+                    const char *n2 = (l2 && strcmp(l2->type, "id") == 0) ? l2->value : NULL;
+                    const char *n3 = (r && strcmp(r->type, "id") == 0) ? r->value : NULL;
+                    MatrixInfo *i1 = find_matrix_info(ctx, n1);
+                    MatrixInfo *i2 = find_matrix_info(ctx, n2);
+                    MatrixInfo *i3 = find_matrix_info(ctx, n3);
+                    if (i1 && i2 && i3 &&
+                        i1->rows == i2->rows && i1->cols == i2->cols &&
+                        i1->rows == i3->rows && i1->cols == i3->cols) {
+                        if (emit_matrix_add3(ctx, node->value, n1, n2, n3,
+                                             i1->rows, i1->cols, out)) {
+                            matrix_props_unknown(lhs_info);
+                            {
+                                char *key = str_printf("mop:matadd(id:%s,id:%s,id:%s)", n1, n2, n3);
+                                mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                            }
+                            matrix_invalidate_name(ctx, node->value);
+                            return;
+                        }
+                    }
+                }
                 const char *left_name = (rhs_node->left && strcmp(rhs_node->left->type, "id") == 0) ? rhs_node->left->value : NULL;
                 const char *right_name = (rhs_node->right && strcmp(rhs_node->right->type, "id") == 0) ? rhs_node->right->value : NULL;
                 MatrixInfo *left_info = find_matrix_info(ctx, left_name);
                 MatrixInfo *right_info = find_matrix_info(ctx, right_name);
                 if (left_info && right_info) {
+                    if (ir_opt_enabled(ctx)) {
+                        char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                        MatExprCache *hit = key ? mat_cache_find(ctx->mat_cse_cache, key) : NULL;
+                        if (hit && hit->name) {
+                            MatrixInfo *cached_info = find_matrix_info(ctx, hit->name);
+                            if (strcmp(hit->name, node->value) == 0) {
+                                matrix_props_copy(lhs_info, cached_info);
+                                free(key);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                            if (emit_matrix_copy(ctx, node->value, hit->name, left_info->rows, left_info->cols, out)) {
+                                matrix_props_copy(lhs_info, cached_info);
+                                free(key);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (key) {
+                            free(key);
+                        }
+                    }
                     if (strcmp(rhs_node->type, "matmul") == 0) {
+                        if (ir_opt_enabled(ctx) &&
+                            left_info->rows == 1 && left_info->cols == 1 &&
+                            right_info->rows == 1 && right_info->cols == 1) {
+                            if (emit_matrix_scalar_binop(ctx, node->value, left_name, right_name, "*", out)) {
+                                matrix_props_unknown(lhs_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) && matrix_is_diagonal(left_info)) {
+                            if (emit_matrix_mul_diag_left(ctx, node->value, left_name, right_name,
+                                                          left_info->rows, right_info->cols, out)) {
+                                if (matrix_is_diagonal(right_info)) {
+                                    matrix_props_set(lhs_info, 1, 0, 0, 1, 1, 1, 1);
+                                } else {
+                                    matrix_props_unknown(lhs_info);
+                                }
+                                if (ir_opt_enabled(ctx)) {
+                                    char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                                    mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                                }
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) && matrix_is_diagonal(right_info)) {
+                            if (emit_matrix_mul_diag_right(ctx, node->value, left_name, right_name,
+                                                           left_info->rows, right_info->cols, out)) {
+                                if (matrix_is_diagonal(left_info)) {
+                                    matrix_props_set(lhs_info, 1, 0, 0, 1, 1, 1, 1);
+                                } else {
+                                    matrix_props_unknown(lhs_info);
+                                }
+                                if (ir_opt_enabled(ctx)) {
+                                    char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                                    mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                                }
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) &&
+                            left_name && right_name && strcmp(left_name, right_name) == 0 &&
+                            matrix_is_symmetric(left_info) && strcmp(node->value, left_name) != 0) {
+                            if (emit_matrix_mul_sym_self(ctx, node->value, left_name, left_info->rows, out)) {
+                                matrix_props_set(lhs_info, 1, 0, 0, 0, 1, 0, 0);
+                                if (ir_opt_enabled(ctx)) {
+                                    char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                                    mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                                }
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) &&
+                            (matrix_is_zero(left_info) || matrix_is_zero(right_info))) {
+                            if (emit_matrix_zero_fill(ctx, node->value, left_info->rows, right_info->cols, out)) {
+                                matrix_props_set(lhs_info, 1, 1, 0, 1, 1, 1, 1);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) && matrix_is_identity(left_info)) {
+                            if (emit_matrix_copy(ctx, node->value, right_name, left_info->rows, right_info->cols, out)) {
+                                matrix_props_copy(lhs_info, right_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) && matrix_is_identity(right_info)) {
+                            if (emit_matrix_copy(ctx, node->value, left_name, left_info->rows, left_info->cols, out)) {
+                                matrix_props_copy(lhs_info, left_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) && left_info->cols == 1 && right_info->rows == 1) {
+                            if (emit_matrix_mul_inner1(ctx, node->value, left_name, right_name,
+                                                       left_info->rows, right_info->cols, out)) {
+                                matrix_props_unknown(lhs_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) &&
+                            left_info->rows == left_info->cols &&
+                            left_info->rows == right_info->rows &&
+                            right_info->rows == right_info->cols &&
+                            left_info->rows == right_info->rows &&
+                            (left_info->rows == 2 || left_info->rows == 3 || left_info->rows == 4)) {
+                            if (emit_matrix_mul_unrolled(ctx, node->value, left_name, right_name,
+                                                         left_info->rows, out)) {
+                                matrix_props_unknown(lhs_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_o2_enabled(ctx) &&
+                            ir_should_use_cache_local_matmul(ctx->opt_level, left_info->rows,
+                                                             left_info->cols, right_info->cols)) {
+                            if (emit_matrix_mul_cache_locality(ctx, node->value, left_name, right_name,
+                                                               left_info->rows, left_info->cols,
+                                                               right_info->cols, out)) {
+                                matrix_props_unknown(lhs_info);
+                                if (ir_opt_enabled(ctx)) {
+                                    char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                                    mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                                }
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
                         if (emit_matrix_mul(ctx, node->value, left_name, right_name,
                                             left_info->rows, left_info->cols, right_info->cols, out)) {
-                            cse_invalidate_name(ctx, node->value);
+                            if (ir_opt_enabled(ctx) &&
+                                matrix_is_diagonal(left_info) && matrix_is_diagonal(right_info)) {
+                                matrix_props_set(lhs_info, 1, 0, 0, 1, 1, 1, 1);
+                            } else {
+                                matrix_props_unknown(lhs_info);
+                            }
+                            if (ir_opt_enabled(ctx)) {
+                                char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                                mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                            }
+                            matrix_invalidate_name(ctx, node->value);
                             return;
                         }
                     } else {
+                        if (ir_opt_enabled(ctx) &&
+                            left_info->rows == 1 && left_info->cols == 1 &&
+                            right_info->rows == 1 && right_info->cols == 1) {
+                            const char *op = (strcmp(rhs_node->type, "matadd") == 0) ? "+" : "-";
+                            if (emit_matrix_scalar_binop(ctx, node->value, left_name, right_name, op, out)) {
+                                matrix_props_unknown(lhs_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) && matrix_is_zero(right_info)) {
+                            if (emit_matrix_copy(ctx, node->value, left_name, left_info->rows, left_info->cols, out)) {
+                                matrix_props_copy(lhs_info, left_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
+                        if (ir_opt_enabled(ctx) &&
+                            strcmp(rhs_node->type, "matadd") == 0 && matrix_is_zero(left_info)) {
+                            if (emit_matrix_copy(ctx, node->value, right_name, right_info->rows, right_info->cols, out)) {
+                                matrix_props_copy(lhs_info, right_info);
+                                matrix_invalidate_name(ctx, node->value);
+                                return;
+                            }
+                        }
                         const char *op = (strcmp(rhs_node->type, "matadd") == 0) ? "+" : "-";
                         if (emit_matrix_add_sub(ctx, node->value, left_name, right_name,
                                                 left_info->rows, left_info->cols, op, out)) {
-                            cse_invalidate_name(ctx, node->value);
+                            if (ir_opt_enabled(ctx) &&
+                                matrix_is_diagonal(left_info) && matrix_is_diagonal(right_info)) {
+                                int is_zero = matrix_is_zero(left_info) && matrix_is_zero(right_info);
+                                matrix_props_set(lhs_info, 1, is_zero, 0, 1, 1, 1, 1);
+                            } else if (ir_opt_enabled(ctx) &&
+                                       matrix_is_symmetric(left_info) && matrix_is_symmetric(right_info)) {
+                                matrix_props_set(lhs_info, 1, 0, 0, 0, 1, 0, 0);
+                            } else if (ir_opt_enabled(ctx) &&
+                                       matrix_is_upper_triangular(left_info) && matrix_is_upper_triangular(right_info)) {
+                                matrix_props_set(lhs_info, 1, 0, 0, 0, 0, 1, 0);
+                            } else if (ir_opt_enabled(ctx) &&
+                                       matrix_is_lower_triangular(left_info) && matrix_is_lower_triangular(right_info)) {
+                                matrix_props_set(lhs_info, 1, 0, 0, 0, 0, 0, 1);
+                            } else {
+                                matrix_props_unknown(lhs_info);
+                            }
+                            if (ir_opt_enabled(ctx)) {
+                                char *key = mat_expr_key(rhs_node->type, left_name, right_name);
+                                mat_cache_add(&ctx->mat_cse_cache, key, node->value);
+                            }
+                            matrix_invalidate_name(ctx, node->value);
                             return;
                         }
                     }
@@ -3034,8 +3822,16 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     rows = rhs_info->rows;
                     cols = rhs_info->cols;
                 }
+                if (ir_opt_enabled(ctx) && rhs_info && rows == 1 && cols == 1) {
+                    if (emit_matrix_scalar_copy(ctx, node->value, rhs_node->value, out)) {
+                        matrix_props_copy(lhs_info, rhs_info);
+                        matrix_invalidate_name(ctx, node->value);
+                        return;
+                    }
+                }
                 if (rhs_info && emit_matrix_copy(ctx, node->value, rhs_node->value, rows, cols, out)) {
-                    cse_invalidate_name(ctx, node->value);
+                    matrix_props_copy(lhs_info, rhs_info);
+                    matrix_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -3052,7 +3848,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     emit_array_copy(ctx, node->value, src_name, size, out);
                 }
                 if (emit_array_sort(ctx, node->value, size, out)) {
-                    cse_invalidate_name(ctx, node->value);
+                    matrix_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -3065,7 +3861,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
             }
             if (rhs_arr && size > 0) {
                 if (emit_array_copy(ctx, node->value, rhs_node->value, size, out)) {
-                    cse_invalidate_name(ctx, node->value);
+                    matrix_invalidate_name(ctx, node->value);
                     return;
                 }
             }
@@ -3077,7 +3873,36 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
             const char *src_name = (rhs_node->left && strcmp(rhs_node->left->type, "id") == 0) ? rhs_node->left->value : NULL;
             MatrixInfo *src_info = find_matrix_info(ctx, src_name);
             if (src_info && src_info->rows > 0 && src_info->cols > 0 && src_info->rows == src_info->cols) {
-                int det_temp = emit_matrix_det(ctx, src_name, src_info->rows, out);
+                int det_temp = -1;
+                char *key = expr_key(rhs_node);
+                if (ir_opt_enabled(ctx) && key) {
+                    ExprCache *hit = expr_cache_find(ctx->cse_cache, key);
+                    if (hit) {
+                        ASTNode id_node;
+                        int addr;
+                        memset(&id_node, 0, sizeof(id_node));
+                        id_node.type = "id";
+                        id_node.value = node->value;
+                        addr = emit_lvalue_addr(ctx, &id_node, out);
+                        ir_printf(ctx, out, "store [t%d], t%d", addr, hit->temp);
+                        if (lhs_is_scalar) {
+                            const_unbind(ctx, lhs_name);
+                        }
+                        matrix_invalidate_name(ctx, node->value);
+                        free(key);
+                        return;
+                    }
+                }
+                if (ir_opt_enabled(ctx) && matrix_is_identity(src_info)) {
+                    det_temp = emit_const(ctx, "int", "1", out);
+                } else if (ir_opt_enabled(ctx) &&
+                           (matrix_is_diagonal(src_info) ||
+                            matrix_is_upper_triangular(src_info) ||
+                            matrix_is_lower_triangular(src_info))) {
+                    det_temp = emit_matrix_det_diag(ctx, src_name, src_info->rows, out);
+                } else {
+                    det_temp = emit_matrix_det(ctx, src_name, src_info->rows, out);
+                }
                 if (det_temp >= 0) {
                     ASTNode id_node;
                     int addr;
@@ -3086,12 +3911,18 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     id_node.value = node->value;
                     addr = emit_lvalue_addr(ctx, &id_node, out);
                     ir_printf(ctx, out, "store [t%d], t%d", addr, det_temp);
+                    if (ir_opt_enabled(ctx) && key) {
+                        expr_cache_add(&ctx->cse_cache, key, det_temp);
+                        key = NULL;
+                    }
                     if (lhs_is_scalar) {
                         const_unbind(ctx, lhs_name);
                     }
-                    cse_invalidate_name(ctx, node->value);
+                    matrix_invalidate_name(ctx, node->value);
+                    free(key);
                     return;
                 }
+                free(key);
             }
         }
     }
@@ -3113,11 +3944,11 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
         if (eval_const_expr(ctx, rhs_node, &val)) {
             const_bind(ctx, lhs_name, &val);
         }
-        cse_invalidate_name(ctx, lhs_name);
+        matrix_invalidate_name(ctx, lhs_name);
     } else if (node->value) {
-        cse_invalidate_name(ctx, node->value);
+        matrix_invalidate_name(ctx, node->value);
     } else if (node->left && node->left->value) {
-        cse_invalidate_name(ctx, node->left->value);
+        matrix_invalidate_name(ctx, node->left->value);
     }
 }
 
@@ -3175,6 +4006,2083 @@ static void emit_array_init_list(IRContext *ctx, const char *name, ASTNode *node
         ir_printf(ctx, out, "store [t%d], t%d", addr, val);
         (*index)++;
     }
+}
+
+static int emit_matrix_add3(IRContext *ctx, const char *dst, const char *a, const char *b, const char *c,
+                            int rows, int cols, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    char row_var[32];
+    char col_var[32];
+    int row_addr;
+    int col_addr;
+    int zero;
+    int one;
+    int rows_const;
+    int cols_const;
+    int four;
+    int cols_bytes;
+    int base_a;
+    int base_b;
+    int base_c;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || !a || !b || !c || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    rows_const = new_temp(ctx);
+    cols_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
+    ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+
+    base_a = new_temp(ctx);
+    base_b = new_temp(ctx);
+    base_c = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_b, safe_str(b));
+    ir_printf(ctx, out, "t%d = addr %s", base_c, safe_str(c));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, rows_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+    col_label = new_label(ctx);
+    col_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", col_label);
+    {
+        int col_val = new_temp(ctx);
+        int col_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, cols_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int row_base_b = new_temp(ctx);
+        int row_base_c = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_val = new_temp(ctx);
+        int col_off = new_temp(ctx);
+        int addr_a;
+        int addr_b;
+        int addr_c;
+        int addr_dst;
+        int val_a;
+        int val_b;
+        int val_c;
+        int sum1;
+        int sum2;
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_b, base_b, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_c, base_c, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        addr_a = new_temp(ctx);
+        addr_b = new_temp(ctx);
+        addr_c = new_temp(ctx);
+        addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_b, row_base_b, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_c, row_base_c, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+
+        val_a = new_temp(ctx);
+        val_b = new_temp(ctx);
+        val_c = new_temp(ctx);
+        sum1 = new_temp(ctx);
+        sum2 = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_b, addr_b);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_c, addr_c);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", sum1, val_a, val_b);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", sum2, sum1, val_c);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, sum2);
+    }
+
+    {
+        int col_val = new_temp(ctx);
+        int col_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+    }
+    ir_printf(ctx, out, "goto L%d", col_label);
+    ir_printf(ctx, out, "label L%d", col_end_label);
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
+}
+
+typedef struct {
+    int rows;
+    int cols;
+    int elems;
+    int known;
+    int is_zero;
+    int is_identity;
+    int is_diagonal;
+    int is_symmetric;
+    int is_upper_triangular;
+    int is_lower_triangular;
+} MatrixInitProps;
+
+static int const_is_one_val(const ConstVal *val)
+{
+    if (!val) {
+        return 0;
+    }
+    if (val->kind == CONST_INT) {
+        return val->i == 1;
+    }
+    if (val->kind == CONST_DECIMAL) {
+        return val->d == 1.0;
+    }
+    if (val->kind == CONST_CHAR) {
+        int ch = 0;
+        if (!parse_char_value(val->s, &ch)) {
+            return 0;
+        }
+        return ch == 1;
+    }
+    return 0;
+}
+
+static void matrix_props_init(MatrixInitProps *props, int rows, int cols)
+{
+    if (!props) {
+        return;
+    }
+    props->rows = rows;
+    props->cols = cols;
+    props->elems = 0;
+    props->known = 1;
+    props->is_zero = 1;
+    props->is_identity = 1;
+    props->is_diagonal = 1;
+    props->is_symmetric = 1;
+    props->is_upper_triangular = 1;
+    props->is_lower_triangular = 1;
+    if (rows <= 0 || cols <= 0 || rows != cols) {
+        props->is_identity = 0;
+        props->is_diagonal = 0;
+        props->is_symmetric = 0;
+        props->is_upper_triangular = 0;
+        props->is_lower_triangular = 0;
+    }
+}
+
+static void matrix_props_visit_list(IRContext *ctx, ASTNode *node, int row, int *col,
+                                    MatrixInitProps *props)
+{
+    if (!node || !col || !props || !props->known) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_list") == 0) {
+        matrix_props_visit_list(ctx, node->left, row, col, props);
+        if (node->right) {
+            matrix_props_visit_list(ctx, node->right, row, col, props);
+        }
+        return;
+    }
+    if (row >= props->rows || *col >= props->cols) {
+        props->known = 0;
+        return;
+    }
+    {
+        ConstVal val;
+        int is_const = eval_const_expr(ctx, node, &val);
+        int is_diag = (row == *col);
+
+        if (!is_const) {
+            props->is_zero = 0;
+            props->is_identity = 0;
+            if (!is_diag) {
+                props->is_diagonal = 0;
+            }
+            props->is_symmetric = 0;
+            props->is_upper_triangular = 0;
+            props->is_lower_triangular = 0;
+        } else {
+            int is_zero = const_is_zero(&val);
+            int is_one = const_is_one_val(&val);
+            if (is_diag) {
+                if (!is_one) {
+                    props->is_identity = 0;
+                }
+                if (!is_zero) {
+                    props->is_zero = 0;
+                }
+            } else {
+                if (!is_zero) {
+                    props->is_zero = 0;
+                    props->is_identity = 0;
+                    props->is_diagonal = 0;
+                }
+            }
+            if (row > *col && !is_zero) {
+                props->is_upper_triangular = 0;
+            }
+            if (row < *col && !is_zero) {
+                props->is_lower_triangular = 0;
+            }
+        }
+        props->elems++;
+        (*col)++;
+    }
+}
+
+static void matrix_props_visit_rows(IRContext *ctx, ASTNode *node, int *row, MatrixInitProps *props)
+{
+    if (!node || !row || !props || !props->known) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_rows") == 0) {
+        matrix_props_visit_rows(ctx, node->left, row, props);
+        matrix_props_visit_rows(ctx, node->right, row, props);
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_row") == 0) {
+        int col = 0;
+        matrix_props_visit_list(ctx, node->left, *row, &col, props);
+        (*row)++;
+        return;
+    }
+    props->known = 0;
+}
+
+static void matrix_collect_list(IRContext *ctx, ASTNode *node, int row, int *col,
+                                int rows, int cols, ConstVal *vals, int *ok)
+{
+    if (!ok || !*ok || !node || !col || !vals) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_list") == 0) {
+        matrix_collect_list(ctx, node->left, row, col, rows, cols, vals, ok);
+        if (node->right) {
+            matrix_collect_list(ctx, node->right, row, col, rows, cols, vals, ok);
+        }
+        return;
+    }
+    if (row >= rows || *col >= cols) {
+        *ok = 0;
+        return;
+    }
+    if (!eval_const_expr(ctx, node, &vals[row * cols + *col])) {
+        *ok = 0;
+        return;
+    }
+    (*col)++;
+}
+
+static void matrix_collect_rows(IRContext *ctx, ASTNode *node, int *row,
+                                int rows, int cols, ConstVal *vals, int *ok)
+{
+    if (!ok || !*ok || !node || !row || !vals) {
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_rows") == 0) {
+        matrix_collect_rows(ctx, node->left, row, rows, cols, vals, ok);
+        matrix_collect_rows(ctx, node->right, row, rows, cols, vals, ok);
+        return;
+    }
+    if (node->type && strcmp(node->type, "init_row") == 0) {
+        int col = 0;
+        matrix_collect_list(ctx, node->left, *row, &col, rows, cols, vals, ok);
+        (*row)++;
+        return;
+    }
+    *ok = 0;
+}
+
+static int matrix_collect_init(IRContext *ctx, ASTNode *node, int rows, int cols, ConstVal *vals)
+{
+    int row = 0;
+    int ok = 1;
+
+    if (!node || rows <= 0 || cols <= 0 || !vals) {
+        return 0;
+    }
+    matrix_collect_rows(ctx, node, &row, rows, cols, vals, &ok);
+    if (!ok || row != rows) {
+        return 0;
+    }
+    return 1;
+}
+
+static int emit_matrix_inverse_triangular(IRContext *ctx, const char *dst, const char *src, int n,
+                                          int is_upper, FILE *out)
+{
+    int col_var_id;
+    int i_var_id;
+    int k_var_id;
+    char col_var[32];
+    char i_var[32];
+    char k_var[32];
+    int col_addr;
+    int i_addr;
+    int k_addr;
+    int zero;
+    int one;
+    int n_const;
+    int neg_one;
+    int col_label;
+    int col_end_label;
+    int i_label;
+    int i_end_label;
+    int k_label;
+    int k_end_label;
+
+    if (!dst || !src || n <= 0) {
+        return 0;
+    }
+
+    /* Ensure destination starts from a clean zero matrix so any
+       reads of not-yet-computed entries are deterministic. */
+    if (!emit_matrix_zero_fill(ctx, dst, n, n, out)) {
+        return 0;
+    }
+
+    col_var_id = new_temp(ctx);
+    i_var_id = new_temp(ctx);
+    k_var_id = new_temp(ctx);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+    snprintf(i_var, sizeof(i_var), "mat_i%d", i_var_id);
+    snprintf(k_var, sizeof(k_var), "mat_k%d", k_var_id);
+
+    ir_printf(ctx, out, "decl int %s", col_var);
+    ir_printf(ctx, out, "decl int %s", i_var);
+    ir_printf(ctx, out, "decl int %s", k_var);
+    col_addr = new_temp(ctx);
+    i_addr = new_temp(ctx);
+    k_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+    ir_printf(ctx, out, "t%d = addr %s", i_addr, i_var);
+    ir_printf(ctx, out, "t%d = addr %s", k_addr, k_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    n_const = new_temp(ctx);
+    neg_one = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", n_const, n);
+    ir_printf(ctx, out, "t%d = const int -1", neg_one);
+
+    ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+    col_label = new_label(ctx);
+    col_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", col_label);
+    {
+        int col_val = new_temp(ctx);
+        int col_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+    }
+
+    if (is_upper) {
+        int start = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", start, n_const, neg_one);
+        ir_printf(ctx, out, "store [t%d], t%d", i_addr, start);
+        i_label = new_label(ctx);
+        i_end_label = new_label(ctx);
+        ir_printf(ctx, out, "label L%d", i_label);
+        {
+            int i_val = new_temp(ctx);
+            int i_cmp = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+            ir_printf(ctx, out, "t%d = ge t%d, t%d", i_cmp, i_val, zero);
+            ir_printf(ctx, out, "ifz t%d goto L%d", i_cmp, i_end_label);
+        }
+        {
+            int sum_var_id = new_temp(ctx);
+            char sum_var[32];
+            int sum_addr;
+            snprintf(sum_var, sizeof(sum_var), "mat_sum%d", sum_var_id);
+            ir_printf(ctx, out, "decl int %s", sum_var);
+            sum_addr = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = addr %s", sum_addr, sum_var);
+            ir_printf(ctx, out, "store [t%d], t%d", sum_addr, zero);
+
+            {
+                int i_val = new_temp(ctx);
+                int k_start = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", k_start, i_val, one);
+                ir_printf(ctx, out, "store [t%d], t%d", k_addr, k_start);
+            }
+            k_label = new_label(ctx);
+            k_end_label = new_label(ctx);
+            ir_printf(ctx, out, "label L%d", k_label);
+            {
+                int k_val = new_temp(ctx);
+                int k_cmp = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+                ir_printf(ctx, out, "t%d = lt t%d, t%d", k_cmp, k_val, n_const);
+                ir_printf(ctx, out, "ifz t%d goto L%d", k_cmp, k_end_label);
+            }
+            {
+                int i_val = new_temp(ctx);
+                int col_val = new_temp(ctx);
+                int k_val = new_temp(ctx);
+                int addr_u;
+                int addr_inv;
+                int val_u;
+                int val_inv;
+                int mul_val;
+                int sum_val;
+                int sum_next;
+
+                ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+                ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+                ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+                addr_u = emit_matrix_elem_addr(ctx, src, i_val, k_val, out);
+                addr_inv = emit_matrix_elem_addr(ctx, dst, k_val, col_val, out);
+                val_u = new_temp(ctx);
+                val_inv = new_temp(ctx);
+                mul_val = new_temp(ctx);
+                sum_val = new_temp(ctx);
+                sum_next = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_u, addr_u);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_inv, addr_inv);
+                ir_printf(ctx, out, "t%d = * t%d, t%d", mul_val, val_u, val_inv);
+                ir_printf(ctx, out, "t%d = load %s", sum_val, sum_var);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", sum_next, sum_val, mul_val);
+                ir_printf(ctx, out, "store [t%d], t%d", sum_addr, sum_next);
+            }
+            {
+                int k_val = new_temp(ctx);
+                int k_next = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", k_next, k_val, one);
+                ir_printf(ctx, out, "store [t%d], t%d", k_addr, k_next);
+            }
+            ir_printf(ctx, out, "goto L%d", k_label);
+            ir_printf(ctx, out, "label L%d", k_end_label);
+
+            {
+                int i_val = new_temp(ctx);
+                int col_val = new_temp(ctx);
+                int addr_diag;
+                int val_diag;
+                int sum_val;
+                int rhs;
+                int diff;
+                int val_out;
+                int addr_out;
+                int eq;
+                int rhs_label;
+                int rhs_end;
+
+                ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+                ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+                addr_diag = emit_matrix_elem_addr(ctx, src, i_val, i_val, out);
+                val_diag = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_diag, addr_diag);
+                sum_val = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", sum_val, sum_var);
+
+                rhs = new_temp(ctx);
+                eq = new_temp(ctx);
+                rhs_label = new_label(ctx);
+                rhs_end = new_label(ctx);
+                ir_printf(ctx, out, "t%d = eq t%d, t%d", eq, i_val, col_val);
+                ir_printf(ctx, out, "ifz t%d goto L%d", eq, rhs_label);
+                ir_printf(ctx, out, "t%d = mov t%d", rhs, one);
+                ir_printf(ctx, out, "goto L%d", rhs_end);
+                ir_printf(ctx, out, "label L%d", rhs_label);
+                ir_printf(ctx, out, "t%d = mov t%d", rhs, zero);
+                ir_printf(ctx, out, "label L%d", rhs_end);
+
+                diff = new_temp(ctx);
+                val_out = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = - t%d, t%d", diff, rhs, sum_val);
+                emit_safe_div(ctx, val_out, diff, val_diag, out);
+                addr_out = emit_matrix_elem_addr(ctx, dst, i_val, col_val, out);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_out, val_out);
+            }
+        }
+        {
+            int i_val = new_temp(ctx);
+            int i_next = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", i_next, i_val, neg_one);
+            ir_printf(ctx, out, "store [t%d], t%d", i_addr, i_next);
+        }
+        ir_printf(ctx, out, "goto L%d", i_label);
+        ir_printf(ctx, out, "label L%d", i_end_label);
+    } else {
+        ir_printf(ctx, out, "store [t%d], t%d", i_addr, zero);
+        i_label = new_label(ctx);
+        i_end_label = new_label(ctx);
+        ir_printf(ctx, out, "label L%d", i_label);
+        {
+            int i_val = new_temp(ctx);
+            int i_cmp = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+            ir_printf(ctx, out, "t%d = lt t%d, t%d", i_cmp, i_val, n_const);
+            ir_printf(ctx, out, "ifz t%d goto L%d", i_cmp, i_end_label);
+        }
+        {
+            int sum_var_id = new_temp(ctx);
+            char sum_var[32];
+            int sum_addr;
+            snprintf(sum_var, sizeof(sum_var), "mat_sum%d", sum_var_id);
+            ir_printf(ctx, out, "decl int %s", sum_var);
+            sum_addr = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = addr %s", sum_addr, sum_var);
+            ir_printf(ctx, out, "store [t%d], t%d", sum_addr, zero);
+
+            ir_printf(ctx, out, "store [t%d], t%d", k_addr, zero);
+            k_label = new_label(ctx);
+            k_end_label = new_label(ctx);
+            ir_printf(ctx, out, "label L%d", k_label);
+            {
+                int k_val = new_temp(ctx);
+                int k_cmp = new_temp(ctx);
+                int i_val = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+                ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+                ir_printf(ctx, out, "t%d = lt t%d, t%d", k_cmp, k_val, i_val);
+                ir_printf(ctx, out, "ifz t%d goto L%d", k_cmp, k_end_label);
+            }
+            {
+                int i_val = new_temp(ctx);
+                int col_val = new_temp(ctx);
+                int k_val = new_temp(ctx);
+                int addr_l;
+                int addr_inv;
+                int val_l;
+                int val_inv;
+                int mul_val;
+                int sum_val;
+                int sum_next;
+
+                ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+                ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+                ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+                addr_l = emit_matrix_elem_addr(ctx, src, i_val, k_val, out);
+                addr_inv = emit_matrix_elem_addr(ctx, dst, k_val, col_val, out);
+                val_l = new_temp(ctx);
+                val_inv = new_temp(ctx);
+                mul_val = new_temp(ctx);
+                sum_val = new_temp(ctx);
+                sum_next = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_l, addr_l);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_inv, addr_inv);
+                ir_printf(ctx, out, "t%d = * t%d, t%d", mul_val, val_l, val_inv);
+                ir_printf(ctx, out, "t%d = load %s", sum_val, sum_var);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", sum_next, sum_val, mul_val);
+                ir_printf(ctx, out, "store [t%d], t%d", sum_addr, sum_next);
+            }
+            {
+                int k_val = new_temp(ctx);
+                int k_next = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", k_next, k_val, one);
+                ir_printf(ctx, out, "store [t%d], t%d", k_addr, k_next);
+            }
+            ir_printf(ctx, out, "goto L%d", k_label);
+            ir_printf(ctx, out, "label L%d", k_end_label);
+
+            {
+                int i_val = new_temp(ctx);
+                int col_val = new_temp(ctx);
+                int addr_diag;
+                int val_diag;
+                int sum_val;
+                int rhs;
+                int diff;
+                int val_out;
+                int addr_out;
+                int eq;
+                int rhs_label;
+                int rhs_end;
+
+                ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+                ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+                addr_diag = emit_matrix_elem_addr(ctx, src, i_val, i_val, out);
+                val_diag = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_diag, addr_diag);
+                sum_val = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", sum_val, sum_var);
+
+                rhs = new_temp(ctx);
+                eq = new_temp(ctx);
+                rhs_label = new_label(ctx);
+                rhs_end = new_label(ctx);
+                ir_printf(ctx, out, "t%d = eq t%d, t%d", eq, i_val, col_val);
+                ir_printf(ctx, out, "ifz t%d goto L%d", eq, rhs_label);
+                ir_printf(ctx, out, "t%d = mov t%d", rhs, one);
+                ir_printf(ctx, out, "goto L%d", rhs_end);
+                ir_printf(ctx, out, "label L%d", rhs_label);
+                ir_printf(ctx, out, "t%d = mov t%d", rhs, zero);
+                ir_printf(ctx, out, "label L%d", rhs_end);
+
+                diff = new_temp(ctx);
+                val_out = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = - t%d, t%d", diff, rhs, sum_val);
+                emit_safe_div(ctx, val_out, diff, val_diag, out);
+                addr_out = emit_matrix_elem_addr(ctx, dst, i_val, col_val, out);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_out, val_out);
+            }
+        }
+        {
+            int i_val = new_temp(ctx);
+            int i_next = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", i_next, i_val, one);
+            ir_printf(ctx, out, "store [t%d], t%d", i_addr, i_next);
+        }
+        ir_printf(ctx, out, "goto L%d", i_label);
+        ir_printf(ctx, out, "label L%d", i_end_label);
+    }
+
+    {
+        int col_val = new_temp(ctx);
+        int col_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+    }
+    ir_printf(ctx, out, "goto L%d", col_label);
+    ir_printf(ctx, out, "label L%d", col_end_label);
+
+    return 1;
+}
+
+static int matrix_props_from_init(IRContext *ctx, ASTNode *node, int rows, int cols,
+                                  int *is_zero, int *is_identity, int *is_diagonal,
+                                  int *is_symmetric, int *is_upper, int *is_lower)
+{
+    MatrixInitProps props;
+    int row = 0;
+
+    if (!node || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+    matrix_props_init(&props, rows, cols);
+    matrix_props_visit_rows(ctx, node, &row, &props);
+    if (!props.known || props.elems != rows * cols) {
+        return 0;
+    }
+    if (is_zero) {
+        *is_zero = props.is_zero;
+    }
+    if (is_identity) {
+        *is_identity = props.is_identity;
+    }
+    if (is_diagonal) {
+        *is_diagonal = props.is_diagonal;
+    }
+    if (is_upper) {
+        *is_upper = props.is_upper_triangular;
+    }
+    if (is_lower) {
+        *is_lower = props.is_lower_triangular;
+    }
+    if (is_symmetric) {
+        *is_symmetric = props.is_symmetric;
+        if (*is_symmetric && rows == cols) {
+            size_t total = (size_t) rows * (size_t) cols;
+            ConstVal *vals = calloc(total, sizeof(ConstVal));
+            if (vals) {
+                int ok = matrix_collect_init(ctx, node, rows, cols, vals);
+                if (ok) {
+                    for (int i = 0; i < rows && ok; i++) {
+                        for (int j = i + 1; j < cols; j++) {
+                            if (!const_val_equal(&vals[i * cols + j], &vals[j * cols + i])) {
+                                ok = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!ok) {
+                    *is_symmetric = 0;
+                }
+                free(vals);
+            } else {
+                *is_symmetric = 0;
+            }
+        } else {
+            *is_symmetric = 0;
+        }
+    }
+    return 1;
+}
+
+static int emit_matrix_zero_fill(IRContext *ctx, const char *dst, int rows, int cols, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    char row_var[32];
+    char col_var[32];
+    int row_addr;
+    int col_addr;
+    int zero;
+    int one;
+    int rows_const;
+    int cols_const;
+    int four;
+    int cols_bytes;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    rows_const = new_temp(ctx);
+    cols_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
+    ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, rows_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+    col_label = new_label(ctx);
+    col_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", col_label);
+    {
+        int col_val = new_temp(ctx);
+        int col_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, cols_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_val = new_temp(ctx);
+        int col_off = new_temp(ctx);
+        int addr_dst;
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, zero);
+    }
+
+    {
+        int col_val = new_temp(ctx);
+        int col_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+    }
+    ir_printf(ctx, out, "goto L%d", col_label);
+    ir_printf(ctx, out, "label L%d", col_end_label);
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_identity_fill(IRContext *ctx, const char *dst, int n, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    char row_var[32];
+    char col_var[32];
+    int row_addr;
+    int col_addr;
+    int zero;
+    int one;
+    int n_const;
+    int four;
+    int cols_bytes;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || n <= 0) {
+        return 0;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    n_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", n_const, n);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, n_const, four);
+
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+    col_label = new_label(ctx);
+    col_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", col_label);
+    {
+        int col_val = new_temp(ctx);
+        int col_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_val = new_temp(ctx);
+        int col_off = new_temp(ctx);
+        int addr_dst;
+        int eq;
+        int set_one_label;
+        int end_label;
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+
+        eq = new_temp(ctx);
+        set_one_label = new_label(ctx);
+        end_label = new_label(ctx);
+        ir_printf(ctx, out, "t%d = eq t%d, t%d", eq, row_val, col_val);
+        ir_printf(ctx, out, "ifz t%d goto L%d", eq, set_one_label);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, one);
+        ir_printf(ctx, out, "goto L%d", end_label);
+        ir_printf(ctx, out, "label L%d", set_one_label);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, zero);
+        ir_printf(ctx, out, "label L%d", end_label);
+    }
+
+    {
+        int col_val = new_temp(ctx);
+        int col_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+    }
+    ir_printf(ctx, out, "goto L%d", col_label);
+    ir_printf(ctx, out, "label L%d", col_end_label);
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_scalar_copy(IRContext *ctx, const char *dst, const char *src, FILE *out)
+{
+    int zero = emit_const(ctx, "int", "0", out);
+    int addr_src = emit_matrix_elem_addr(ctx, src, zero, zero, out);
+    int addr_dst = emit_matrix_elem_addr(ctx, dst, zero, zero, out);
+    int val = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = load [t%d]", val, addr_src);
+    ir_printf(ctx, out, "store [t%d], t%d", addr_dst, val);
+    return 1;
+}
+
+static int emit_matrix_scalar_binop(IRContext *ctx, const char *dst, const char *a, const char *b,
+                                    const char *op, FILE *out)
+{
+    int zero = emit_const(ctx, "int", "0", out);
+    int addr_a = emit_matrix_elem_addr(ctx, a, zero, zero, out);
+    int addr_b = emit_matrix_elem_addr(ctx, b, zero, zero, out);
+    int addr_dst = emit_matrix_elem_addr(ctx, dst, zero, zero, out);
+    int val_a = new_temp(ctx);
+    int val_b = new_temp(ctx);
+    int val_out = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+    ir_printf(ctx, out, "t%d = load [t%d]", val_b, addr_b);
+    ir_printf(ctx, out, "t%d = %s t%d, t%d", val_out, op, val_a, val_b);
+    ir_printf(ctx, out, "store [t%d], t%d", addr_dst, val_out);
+    return 1;
+}
+
+static int emit_matrix_mul_inner1(IRContext *ctx, const char *dst, const char *a, const char *b,
+                                  int rows, int cols, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    char row_var[32];
+    char col_var[32];
+    int row_addr;
+    int col_addr;
+    int zero;
+    int one;
+    int rows_const;
+    int cols_const;
+    int four;
+    int cols_bytes;
+    int base_a;
+    int base_b;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || !a || !b || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    rows_const = new_temp(ctx);
+    cols_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
+    ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+
+    base_a = new_temp(ctx);
+    base_b = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_b, safe_str(b));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, rows_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+    col_label = new_label(ctx);
+    col_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", col_label);
+    {
+        int col_val = new_temp(ctx);
+        int col_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, cols_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int col_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_off = new_temp(ctx);
+        int addr_a;
+        int addr_b;
+        int addr_dst;
+        int val_a;
+        int val_b;
+        int val_out;
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, four);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+        {
+            int row_off_dst = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_dst, row_val, cols_bytes);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off_dst);
+        }
+
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        addr_a = new_temp(ctx);
+        addr_b = new_temp(ctx);
+        addr_dst = new_temp(ctx);
+
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, zero);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_b, base_b, col_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+
+        val_a = new_temp(ctx);
+        val_b = new_temp(ctx);
+        val_out = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_b, addr_b);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", val_out, val_a, val_b);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, val_out);
+    }
+
+    {
+        int col_val = new_temp(ctx);
+        int col_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+    }
+    ir_printf(ctx, out, "goto L%d", col_label);
+    ir_printf(ctx, out, "label L%d", col_end_label);
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_mul_diag_left(IRContext *ctx, const char *dst, const char *diag, const char *a,
+                                     int rows, int cols, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    char row_var[32];
+    char col_var[32];
+    int row_addr;
+    int col_addr;
+    int zero;
+    int one;
+    int rows_const;
+    int cols_const;
+    int four;
+    int cols_bytes;
+    int diag_cols_bytes;
+    int base_diag;
+    int base_a;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || !diag || !a || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    rows_const = new_temp(ctx);
+    cols_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
+    ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    diag_cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", diag_cols_bytes, rows_const, four);
+
+    base_diag = new_temp(ctx);
+    base_a = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_diag, safe_str(diag));
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, rows_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int row_off_diag = new_temp(ctx);
+        int row_base_diag = new_temp(ctx);
+        int col_off_diag = new_temp(ctx);
+        int addr_diag;
+        int diag_val;
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_diag, row_val, diag_cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_diag, base_diag, row_off_diag);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off_diag, row_val, four);
+        addr_diag = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_diag, row_base_diag, col_off_diag);
+        diag_val = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load [t%d]", diag_val, addr_diag);
+
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+        col_label = new_label(ctx);
+        col_end_label = new_label(ctx);
+        ir_printf(ctx, out, "label L%d", col_label);
+        {
+            int col_val = new_temp(ctx);
+            int col_cmp = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+            ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, cols_const);
+            ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+        }
+        {
+            int col_val = new_temp(ctx);
+            int col_off = new_temp(ctx);
+            int addr_a;
+            int addr_dst;
+            int val_a;
+            int val_out;
+
+            ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+            addr_a = new_temp(ctx);
+            addr_dst = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, col_off);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+            val_a = new_temp(ctx);
+            val_out = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_out, diag_val, val_a);
+            ir_printf(ctx, out, "store [t%d], t%d", addr_dst, val_out);
+        }
+        {
+            int col_val = new_temp(ctx);
+            int col_next = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+            ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+        }
+        ir_printf(ctx, out, "goto L%d", col_label);
+        ir_printf(ctx, out, "label L%d", col_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_mul_diag_right(IRContext *ctx, const char *dst, const char *a, const char *diag,
+                                      int rows, int cols, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    char row_var[32];
+    char col_var[32];
+    int row_addr;
+    int col_addr;
+    int zero;
+    int one;
+    int rows_const;
+    int cols_const;
+    int four;
+    int cols_bytes;
+    int diag_cols_bytes;
+    int base_diag;
+    int base_a;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || !diag || !a || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    rows_const = new_temp(ctx);
+    cols_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", rows_const, rows);
+    ir_printf(ctx, out, "t%d = const int %d", cols_const, cols);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    diag_cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, cols_const, four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", diag_cols_bytes, cols_const, four);
+
+    base_diag = new_temp(ctx);
+    base_a = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_diag, safe_str(diag));
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, rows_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, cols_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+        col_label = new_label(ctx);
+        col_end_label = new_label(ctx);
+        ir_printf(ctx, out, "label L%d", col_label);
+        {
+            int col_val = new_temp(ctx);
+            int col_cmp = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+            ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, cols_const);
+            ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+        }
+        {
+            int col_val = new_temp(ctx);
+            int col_off = new_temp(ctx);
+            int diag_row_off = new_temp(ctx);
+            int diag_row_base = new_temp(ctx);
+            int addr_diag;
+            int addr_a;
+            int addr_dst;
+            int val_diag;
+            int val_a;
+            int val_out;
+
+            ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", diag_row_off, col_val, diag_cols_bytes);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", diag_row_base, base_diag, diag_row_off);
+            addr_diag = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_diag, diag_row_base, col_off);
+
+            addr_a = new_temp(ctx);
+            addr_dst = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, col_off);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+            val_diag = new_temp(ctx);
+            val_a = new_temp(ctx);
+            val_out = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load [t%d]", val_diag, addr_diag);
+            ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", val_out, val_a, val_diag);
+            ir_printf(ctx, out, "store [t%d], t%d", addr_dst, val_out);
+        }
+        {
+            int col_val = new_temp(ctx);
+            int col_next = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+            ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+        }
+        ir_printf(ctx, out, "goto L%d", col_label);
+        ir_printf(ctx, out, "label L%d", col_end_label);
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_mul_sym_self(IRContext *ctx, const char *dst, const char *a, int n, FILE *out)
+{
+    int i_var_id;
+    int j_var_id;
+    int k_var_id;
+    char i_var[32];
+    char j_var[32];
+    char k_var[32];
+    int i_addr;
+    int j_addr;
+    int k_addr;
+    int zero;
+    int one;
+    int zero_dec;
+    int one_dec;
+    int n_const;
+    int four;
+    int cols_bytes;
+    int base_a;
+    int base_dst;
+    int i_label;
+    int i_end_label;
+    int j_label;
+    int j_end_label;
+    int k_label;
+    int k_end_label;
+
+    if (!dst || !a || n <= 0) {
+        return 0;
+    }
+
+    i_var_id = new_temp(ctx);
+    j_var_id = new_temp(ctx);
+    k_var_id = new_temp(ctx);
+    snprintf(i_var, sizeof(i_var), "mat_i%d", i_var_id);
+    snprintf(j_var, sizeof(j_var), "mat_j%d", j_var_id);
+    snprintf(k_var, sizeof(k_var), "mat_k%d", k_var_id);
+
+    ir_printf(ctx, out, "decl int %s", i_var);
+    ir_printf(ctx, out, "decl int %s", j_var);
+    ir_printf(ctx, out, "decl int %s", k_var);
+    i_addr = new_temp(ctx);
+    j_addr = new_temp(ctx);
+    k_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", i_addr, i_var);
+    ir_printf(ctx, out, "t%d = addr %s", j_addr, j_var);
+    ir_printf(ctx, out, "t%d = addr %s", k_addr, k_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    zero_dec = new_temp(ctx);
+    one_dec = new_temp(ctx);
+    n_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const decimal 0.0", zero_dec);
+    ir_printf(ctx, out, "t%d = const decimal 1.0", one_dec);
+    ir_printf(ctx, out, "t%d = const int %d", n_const, n);
+    four = new_temp(ctx);
+    cols_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", cols_bytes, n_const, four);
+
+    base_a = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", i_addr, zero);
+    i_label = new_label(ctx);
+    i_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", i_label);
+    {
+        int i_val = new_temp(ctx);
+        int i_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", i_cmp, i_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", i_cmp, i_end_label);
+    }
+    {
+        int i_val = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "store [t%d], t%d", j_addr, i_val);
+    }
+    j_label = new_label(ctx);
+    j_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", j_label);
+    {
+        int j_val = new_temp(ctx);
+        int j_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", j_cmp, j_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", j_cmp, j_end_label);
+    }
+    {
+        int acc_var_id = new_temp(ctx);
+        char acc_var[32];
+        int acc_addr;
+        snprintf(acc_var, sizeof(acc_var), "mat_acc%d", acc_var_id);
+        ir_printf(ctx, out, "decl int %s", acc_var);
+        acc_addr = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = addr %s", acc_addr, acc_var);
+        ir_printf(ctx, out, "store [t%d], t%d", acc_addr, zero);
+
+        ir_printf(ctx, out, "store [t%d], t%d", k_addr, zero);
+        k_label = new_label(ctx);
+        k_end_label = new_label(ctx);
+        ir_printf(ctx, out, "label L%d", k_label);
+        {
+            int k_val = new_temp(ctx);
+            int k_cmp = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+            ir_printf(ctx, out, "t%d = lt t%d, t%d", k_cmp, k_val, n_const);
+            ir_printf(ctx, out, "ifz t%d goto L%d", k_cmp, k_end_label);
+        }
+        {
+            int i_val = new_temp(ctx);
+            int j_val = new_temp(ctx);
+            int k_val = new_temp(ctx);
+            int row_off_i = new_temp(ctx);
+            int row_off_j = new_temp(ctx);
+            int row_base_i = new_temp(ctx);
+            int row_base_j = new_temp(ctx);
+            int col_off = new_temp(ctx);
+            int addr_i;
+            int addr_j;
+            int val_i;
+            int val_j;
+            int mul_val;
+            int acc_val;
+            int acc_next;
+
+            ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+            ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+            ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_i, i_val, cols_bytes);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_j, j_val, cols_bytes);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_i, base_a, row_off_i);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_j, base_a, row_off_j);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, k_val, four);
+            addr_i = new_temp(ctx);
+            addr_j = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_i, row_base_i, col_off);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_j, row_base_j, col_off);
+            val_i = new_temp(ctx);
+            val_j = new_temp(ctx);
+            mul_val = new_temp(ctx);
+            acc_val = new_temp(ctx);
+            acc_next = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load [t%d]", val_i, addr_i);
+            ir_printf(ctx, out, "t%d = load [t%d]", val_j, addr_j);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_val, val_i, val_j);
+            ir_printf(ctx, out, "t%d = load %s", acc_val, acc_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", acc_next, acc_val, mul_val);
+            ir_printf(ctx, out, "store [t%d], t%d", acc_addr, acc_next);
+        }
+        {
+            int k_val = new_temp(ctx);
+            int k_next = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load %s", k_val, k_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", k_next, k_val, one);
+            ir_printf(ctx, out, "store [t%d], t%d", k_addr, k_next);
+        }
+        ir_printf(ctx, out, "goto L%d", k_label);
+        ir_printf(ctx, out, "label L%d", k_end_label);
+
+        {
+            int i_val = new_temp(ctx);
+            int j_val = new_temp(ctx);
+            int acc_val = new_temp(ctx);
+            int row_off_i = new_temp(ctx);
+            int row_off_j = new_temp(ctx);
+            int row_base_dst_i = new_temp(ctx);
+            int row_base_dst_j = new_temp(ctx);
+            int col_off = new_temp(ctx);
+            int addr_ij;
+            int addr_ji;
+            int eq;
+            int skip_label;
+
+            ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+            ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+            ir_printf(ctx, out, "t%d = load %s", acc_val, acc_var);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_i, i_val, cols_bytes);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", row_off_j, j_val, cols_bytes);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst_i, base_dst, row_off_i);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst_j, base_dst, row_off_j);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, j_val, four);
+            addr_ij = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_ij, row_base_dst_i, col_off);
+            ir_printf(ctx, out, "store [t%d], t%d", addr_ij, acc_val);
+
+            eq = new_temp(ctx);
+            skip_label = new_label(ctx);
+            {
+                int after_label = new_label(ctx);
+                ir_printf(ctx, out, "t%d = eq t%d, t%d", eq, i_val, j_val);
+                ir_printf(ctx, out, "ifz t%d goto L%d", eq, skip_label);
+                ir_printf(ctx, out, "goto L%d", after_label);
+                ir_printf(ctx, out, "label L%d", skip_label);
+
+                addr_ji = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, i_val, four);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", addr_ji, row_base_dst_j, col_off);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_ji, acc_val);
+                ir_printf(ctx, out, "label L%d", after_label);
+            }
+        }
+    }
+    {
+        int j_val = new_temp(ctx);
+        int j_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", j_next, j_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", j_addr, j_next);
+    }
+    ir_printf(ctx, out, "goto L%d", j_label);
+    ir_printf(ctx, out, "label L%d", j_end_label);
+
+    {
+        int i_val = new_temp(ctx);
+        int i_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", i_next, i_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", i_addr, i_next);
+    }
+    ir_printf(ctx, out, "goto L%d", i_label);
+    ir_printf(ctx, out, "label L%d", i_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_transpose_inplace(IRContext *ctx, const char *name, int n, FILE *out)
+{
+    int i_var_id;
+    int j_var_id;
+    char i_var[32];
+    char j_var[32];
+    int i_addr;
+    int j_addr;
+    int zero;
+    int one;
+    int n_const;
+    int i_label;
+    int i_end_label;
+    int j_label;
+    int j_end_label;
+
+    if (!name || n <= 1) {
+        return 0;
+    }
+
+    i_var_id = new_temp(ctx);
+    j_var_id = new_temp(ctx);
+    snprintf(i_var, sizeof(i_var), "mat_i%d", i_var_id);
+    snprintf(j_var, sizeof(j_var), "mat_j%d", j_var_id);
+
+    ir_printf(ctx, out, "decl int %s", i_var);
+    ir_printf(ctx, out, "decl int %s", j_var);
+    i_addr = new_temp(ctx);
+    j_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", i_addr, i_var);
+    ir_printf(ctx, out, "t%d = addr %s", j_addr, j_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    n_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", n_const, n);
+
+    ir_printf(ctx, out, "store [t%d], t%d", i_addr, zero);
+    i_label = new_label(ctx);
+    i_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", i_label);
+    {
+        int i_val = new_temp(ctx);
+        int i_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", i_cmp, i_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", i_cmp, i_end_label);
+    }
+
+    {
+        int i_val = new_temp(ctx);
+        int j_start = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", j_start, i_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", j_addr, j_start);
+    }
+    j_label = new_label(ctx);
+    j_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", j_label);
+    {
+        int j_val = new_temp(ctx);
+        int j_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", j_cmp, j_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", j_cmp, j_end_label);
+    }
+    {
+        int i_val = new_temp(ctx);
+        int j_val = new_temp(ctx);
+        int addr_ij;
+        int addr_ji;
+        int val_ij;
+        int val_ji;
+
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+        addr_ij = emit_matrix_elem_addr(ctx, name, i_val, j_val, out);
+        addr_ji = emit_matrix_elem_addr(ctx, name, j_val, i_val, out);
+        val_ij = new_temp(ctx);
+        val_ji = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_ij, addr_ij);
+        ir_printf(ctx, out, "t%d = load [t%d]", val_ji, addr_ji);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_ij, val_ji);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_ji, val_ij);
+    }
+    {
+        int j_val = new_temp(ctx);
+        int j_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", j_next, j_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", j_addr, j_next);
+    }
+    ir_printf(ctx, out, "goto L%d", j_label);
+    ir_printf(ctx, out, "label L%d", j_end_label);
+
+    {
+        int i_val = new_temp(ctx);
+        int i_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", i_next, i_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", i_addr, i_next);
+    }
+    ir_printf(ctx, out, "goto L%d", i_label);
+    ir_printf(ctx, out, "label L%d", i_end_label);
+
+    return 1;
+}
+
+static int emit_matrix_mul_unrolled(IRContext *ctx, const char *dst, const char *a, const char *b,
+                                    int n, FILE *out)
+{
+    int row_var_id;
+    int col_var_id;
+    int acc_var_id;
+    char row_var[32];
+    char col_var[32];
+    char acc_var[32];
+    int row_addr;
+    int col_addr;
+    int acc_addr;
+    int zero;
+    int one;
+    int n_const;
+    int four;
+    int n_bytes;
+    int base_a;
+    int base_b;
+    int base_dst;
+    int row_label;
+    int row_end_label;
+    int col_label;
+    int col_end_label;
+
+    if (!dst || !a || !b || n <= 0) {
+        return 0;
+    }
+
+    if (n == 2) {
+        for (int r = 0; r < n; r++) {
+            for (int c = 0; c < n; c++) {
+                int acc = -1;
+                for (int k = 0; k < n; k++) {
+                    char rbuf[16];
+                    char cbuf[16];
+                    char kbuf[16];
+                    int rtemp;
+                    int ctemp;
+                    int ktemp;
+                    int addr_a;
+                    int addr_b;
+                    int val_a;
+                    int val_b;
+                    int mul_val;
+
+                    snprintf(rbuf, sizeof(rbuf), "%d", r);
+                    snprintf(cbuf, sizeof(cbuf), "%d", c);
+                    snprintf(kbuf, sizeof(kbuf), "%d", k);
+                    rtemp = emit_const(ctx, "int", rbuf, out);
+                    ctemp = emit_const(ctx, "int", cbuf, out);
+                    ktemp = emit_const(ctx, "int", kbuf, out);
+
+                    addr_a = emit_matrix_elem_addr(ctx, a, rtemp, ktemp, out);
+                    addr_b = emit_matrix_elem_addr(ctx, b, ktemp, ctemp, out);
+                    val_a = new_temp(ctx);
+                    val_b = new_temp(ctx);
+                    mul_val = new_temp(ctx);
+                    ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+                    ir_printf(ctx, out, "t%d = load [t%d]", val_b, addr_b);
+                    ir_printf(ctx, out, "t%d = * t%d, t%d", mul_val, val_a, val_b);
+
+                    if (acc < 0) {
+                        acc = mul_val;
+                    } else {
+                        int sum = new_temp(ctx);
+                        ir_printf(ctx, out, "t%d = + t%d, t%d", sum, acc, mul_val);
+                        acc = sum;
+                    }
+                }
+                {
+                    char rbuf[16];
+                    char cbuf[16];
+                    int rtemp;
+                    int ctemp;
+                    int addr_dst;
+                    snprintf(rbuf, sizeof(rbuf), "%d", r);
+                    snprintf(cbuf, sizeof(cbuf), "%d", c);
+                    rtemp = emit_const(ctx, "int", rbuf, out);
+                    ctemp = emit_const(ctx, "int", cbuf, out);
+                    addr_dst = emit_matrix_elem_addr(ctx, dst, rtemp, ctemp, out);
+                    ir_printf(ctx, out, "store [t%d], t%d", addr_dst, acc);
+                }
+            }
+        }
+        return 1;
+    }
+
+    row_var_id = new_temp(ctx);
+    col_var_id = new_temp(ctx);
+    acc_var_id = new_temp(ctx);
+    snprintf(row_var, sizeof(row_var), "mat_r%d", row_var_id);
+    snprintf(col_var, sizeof(col_var), "mat_c%d", col_var_id);
+    snprintf(acc_var, sizeof(acc_var), "mat_acc%d", acc_var_id);
+
+    ir_printf(ctx, out, "decl int %s", row_var);
+    ir_printf(ctx, out, "decl int %s", col_var);
+    ir_printf(ctx, out, "decl int %s", acc_var);
+
+    row_addr = new_temp(ctx);
+    col_addr = new_temp(ctx);
+    acc_addr = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", row_addr, row_var);
+    ir_printf(ctx, out, "t%d = addr %s", col_addr, col_var);
+    ir_printf(ctx, out, "t%d = addr %s", acc_addr, acc_var);
+
+    zero = new_temp(ctx);
+    one = new_temp(ctx);
+    n_const = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 0", zero);
+    ir_printf(ctx, out, "t%d = const int 1", one);
+    ir_printf(ctx, out, "t%d = const int %d", n_const, n);
+
+    four = new_temp(ctx);
+    n_bytes = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = const int 4", four);
+    ir_printf(ctx, out, "t%d = * t%d, t%d", n_bytes, n_const, four);
+
+    base_a = new_temp(ctx);
+    base_b = new_temp(ctx);
+    base_dst = new_temp(ctx);
+    ir_printf(ctx, out, "t%d = addr %s", base_a, safe_str(a));
+    ir_printf(ctx, out, "t%d = addr %s", base_b, safe_str(b));
+    ir_printf(ctx, out, "t%d = addr %s", base_dst, safe_str(dst));
+
+    ir_printf(ctx, out, "store [t%d], t%d", row_addr, zero);
+    row_label = new_label(ctx);
+    row_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", row_label);
+    {
+        int row_val = new_temp(ctx);
+        int row_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", row_cmp, row_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", row_cmp, row_end_label);
+    }
+
+    ir_printf(ctx, out, "store [t%d], t%d", col_addr, zero);
+    col_label = new_label(ctx);
+    col_end_label = new_label(ctx);
+    ir_printf(ctx, out, "label L%d", col_label);
+    {
+        int col_val = new_temp(ctx);
+        int col_cmp = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = lt t%d, t%d", col_cmp, col_val, n_const);
+        ir_printf(ctx, out, "ifz t%d goto L%d", col_cmp, col_end_label);
+    }
+
+    ir_printf(ctx, out, "store [t%d], t%d", acc_addr, zero);
+    {
+        int row_val = new_temp(ctx);
+        int col_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_a = new_temp(ctx);
+        int col_off = new_temp(ctx);
+
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, n_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_a, base_a, row_off);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+
+        for (int k = 0; k < n; k++) {
+            char kbuf[16];
+            int ktemp;
+            int k_off;
+            int addr_a;
+            int b_row_off;
+            int b_off;
+            int addr_b;
+            int val_a;
+            int val_b;
+            int mul_val;
+            int acc_val;
+            int acc_next;
+
+            snprintf(kbuf, sizeof(kbuf), "%d", k);
+            ktemp = emit_const(ctx, "int", kbuf, out);
+            k_off = new_temp(ctx);
+            addr_a = new_temp(ctx);
+            b_row_off = new_temp(ctx);
+            b_off = new_temp(ctx);
+            addr_b = new_temp(ctx);
+
+            ir_printf(ctx, out, "t%d = * t%d, t%d", k_off, ktemp, four);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_a, row_base_a, k_off);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", b_row_off, ktemp, n_bytes);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", b_off, b_row_off, col_off);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", addr_b, base_b, b_off);
+
+            val_a = new_temp(ctx);
+            val_b = new_temp(ctx);
+            mul_val = new_temp(ctx);
+            acc_val = new_temp(ctx);
+            acc_next = new_temp(ctx);
+
+            ir_printf(ctx, out, "t%d = load [t%d]", val_a, addr_a);
+            ir_printf(ctx, out, "t%d = load [t%d]", val_b, addr_b);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", mul_val, val_a, val_b);
+            ir_printf(ctx, out, "t%d = load %s", acc_val, acc_var);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", acc_next, acc_val, mul_val);
+            ir_printf(ctx, out, "store [t%d], t%d", acc_addr, acc_next);
+        }
+    }
+
+    {
+        int row_val = new_temp(ctx);
+        int col_val = new_temp(ctx);
+        int acc_val = new_temp(ctx);
+        int row_off = new_temp(ctx);
+        int row_base_dst = new_temp(ctx);
+        int col_off = new_temp(ctx);
+        int addr_dst = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", row_off, row_val, n_bytes);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_base_dst, base_dst, row_off);
+        ir_printf(ctx, out, "t%d = * t%d, t%d", col_off, col_val, four);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", addr_dst, row_base_dst, col_off);
+        ir_printf(ctx, out, "t%d = load %s", acc_val, acc_var);
+        ir_printf(ctx, out, "store [t%d], t%d", addr_dst, acc_val);
+    }
+
+    {
+        int col_val = new_temp(ctx);
+        int col_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", col_val, col_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", col_next, col_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", col_addr, col_next);
+    }
+    ir_printf(ctx, out, "goto L%d", col_label);
+    ir_printf(ctx, out, "label L%d", col_end_label);
+
+    {
+        int row_val = new_temp(ctx);
+        int row_next = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = load %s", row_val, row_var);
+        ir_printf(ctx, out, "t%d = + t%d, t%d", row_next, row_val, one);
+        ir_printf(ctx, out, "store [t%d], t%d", row_addr, row_next);
+    }
+    ir_printf(ctx, out, "goto L%d", row_label);
+    ir_printf(ctx, out, "label L%d", row_end_label);
+
+    return 1;
 }
 
 static void emit_matrix_init_rows(IRContext *ctx, const char *name, ASTNode *node, int *row, FILE *out)
@@ -3245,7 +6153,7 @@ static void emit_array_decl(IRContext *ctx, ASTNode *node, FILE *out)
         int index = 0;
         emit_array_init_list(ctx, node->value, node->third, &index, out);
         const_unbind(ctx, node->value);
-        cse_invalidate_name(ctx, node->value);
+        matrix_invalidate_name(ctx, node->value);
     }
 }
 
@@ -3259,8 +6167,25 @@ static void emit_matrix_decl(IRContext *ctx, ASTNode *node, FILE *out)
     ir_printf(ctx, out, "decl_matrix %s, %s, %s", safe_str(node->value), rows, cols);
     if (node->third && node->value) {
         emit_matrix_init(ctx, node->value, node->third, out);
+        {
+            MatrixInfo *info = find_matrix_info(ctx, node->value);
+            int is_zero = 0;
+            int is_identity = 0;
+            int is_diagonal = 0;
+            int is_symmetric = 0;
+            int is_upper = 0;
+            int is_lower = 0;
+            if (info && matrix_props_from_init(ctx, node->third, info->rows, info->cols,
+                                               &is_zero, &is_identity, &is_diagonal,
+                                               &is_symmetric, &is_upper, &is_lower)) {
+                matrix_props_set(info, 1, is_zero, is_identity, is_diagonal,
+                                 is_symmetric, is_upper, is_lower);
+            } else if (info) {
+                matrix_props_unknown(info);
+            }
+        }
         const_unbind(ctx, node->value);
-        cse_invalidate_name(ctx, node->value);
+        matrix_invalidate_name(ctx, node->value);
     }
 }
 
@@ -3654,11 +6579,17 @@ static void emit_for_body(IRContext *ctx, ASTNode *node, FILE *out)
     }
 
     emit_stmt(ctx, for_node->left, out, end_label, continue_label);
-    if (for_node->right && eval_const_expr(ctx, for_node->right, &folded) &&
-        const_to_bool(&folded, &cond_bool)) {
-        cond_is_const = 1;
-        if (!cond_bool) {
-            return;
+    if (for_node->right && for_node->right->type &&
+        (strcmp(for_node->right->type, "int") == 0 ||
+         strcmp(for_node->right->type, "decimal") == 0 ||
+         strcmp(for_node->right->type, "char") == 0 ||
+         strcmp(for_node->right->type, "string") == 0)) {
+        if (eval_const_expr(ctx, for_node->right, &folded) &&
+            const_to_bool(&folded, &cond_bool)) {
+            cond_is_const = 1;
+            if (!cond_bool) {
+                return;
+            }
         }
     }
 
@@ -3685,11 +6616,19 @@ static void emit_while(IRContext *ctx, ASTNode *node, FILE *out)
     ConstVal folded;
 
     cse_clear(ctx);
-    if (eval_const_expr(ctx, node->left, &folded) &&
-        const_to_bool(&folded, &cond_bool)) {
-        cond_is_const = 1;
-        if (!cond_bool) {
-            return;
+    /* Only fold while-conditions that are literal constants.
+       Folding on variables can create incorrect infinite loops. */
+    if (node->left && node->left->type &&
+        (strcmp(node->left->type, "int") == 0 ||
+         strcmp(node->left->type, "decimal") == 0 ||
+         strcmp(node->left->type, "char") == 0 ||
+         strcmp(node->left->type, "string") == 0)) {
+        if (eval_const_expr(ctx, node->left, &folded) &&
+            const_to_bool(&folded, &cond_bool)) {
+            cond_is_const = 1;
+            if (!cond_bool) {
+                return;
+            }
         }
     }
     ir_printf(ctx, out, "label L%d", start_label);
@@ -3877,7 +6816,7 @@ static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label,
         strcmp(node->type, "post_inc") == 0 || strcmp(node->type, "post_dec") == 0) {
         emit_expr(ctx, node, out);
         if (node->left && node->left->value) {
-            cse_invalidate_name(ctx, node->left->value);
+            matrix_invalidate_name(ctx, node->left->value);
         }
         return;
     }
@@ -3931,9 +6870,9 @@ static void emit_stmt(IRContext *ctx, ASTNode *node, FILE *out, int break_label,
         ir_printf(ctx, out, "scan [t%d]", addr);
         if (node->left && strcmp(node->left->type, "id") == 0) {
             const_unbind(ctx, node->left->value);
-            cse_invalidate_name(ctx, node->left->value);
+            matrix_invalidate_name(ctx, node->left->value);
         } else if (node->left && node->left->value) {
-            cse_invalidate_name(ctx, node->left->value);
+            matrix_invalidate_name(ctx, node->left->value);
         }
         return;
     }
@@ -4232,12 +7171,41 @@ static int parse_binary_op(const char *line, int *dst, char *op, size_t op_size,
     return sscanf(line, "t%d = %31s t%d, t%d", dst, op, lhs, rhs) == 4;
 }
 
+static int is_unary_ir_op(const char *op)
+{
+    if (!op) {
+        return 0;
+    }
+    return strcmp(op, "uminus") == 0 ||
+           strcmp(op, "not") == 0 ||
+           strcmp(op, "size") == 0 ||
+           strcmp(op, "sort") == 0 ||
+           strcmp(op, "transpose") == 0 ||
+           strcmp(op, "det") == 0 ||
+           strcmp(op, "inv") == 0 ||
+           strcmp(op, "shape") == 0;
+}
+
 static int parse_unary_op(const char *line, int *dst, char *op, size_t op_size, int *arg)
 {
     if (!line || !dst || !op || !arg) {
         return 0;
     }
-    return sscanf(line, "t%d = %31s t%d", dst, op, arg) == 3;
+    {
+        int n = 0;
+        if (sscanf(line, "t%d = %31s t%d %n", dst, op, arg, &n) != 3) {
+            return 0;
+        }
+        if (!is_unary_ir_op(op)) {
+            return 0;
+        }
+        for (const char *p = line + n; *p; p++) {
+            if (!isspace((unsigned char) *p)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
 }
 
 static int temp_resolve(TempInfo *temps, int max_temp, int temp)
@@ -4552,6 +7520,35 @@ static char **build_addr_name_map(char **lines, int line_count, int max_temp)
             }
         }
     }
+    for (int i = 0; i < line_count; i++) {
+        int dst = 0;
+        int src = 0;
+        int lhs = 0;
+        int rhs = 0;
+        char op[32];
+        if (parse_mov_def(lines[i], &dst, &src)) {
+            if (dst > 0 && dst <= max_temp && src > 0 && src <= max_temp &&
+                map[src] && !map[dst]) {
+                map[dst] = strdup(map[src]);
+            }
+            continue;
+        }
+        if (parse_binary_op(lines[i], &dst, op, sizeof(op), &lhs, &rhs)) {
+            if (dst <= 0 || dst > max_temp) {
+                continue;
+            }
+            if (!(strcmp(op, "add") == 0 || strcmp(op, "+") == 0)) {
+                continue;
+            }
+            if (lhs > 0 && lhs <= max_temp && rhs > 0 && rhs <= max_temp) {
+                if (map[lhs] && !map[rhs] && !map[dst]) {
+                    map[dst] = strdup(map[lhs]);
+                } else if (map[rhs] && !map[lhs] && !map[dst]) {
+                    map[dst] = strdup(map[rhs]);
+                }
+            }
+        }
+    }
     return map;
 }
 
@@ -4618,27 +7615,7 @@ static void apply_propagation(IRContext *ctx)
 
         if (parse_const_def(ctx->lines[i], &def, kind, sizeof(kind), value, sizeof(value))) {
             char *key = str_printf("%s:%s", kind, value);
-            int reused = 0;
             if (key) {
-                for (int c = 0; c < const_count; c++) {
-                    if (strcmp(const_key[c], key) == 0) {
-                        int src_temp = const_temp[c];
-                        if (src_temp > 0 && src_temp <= max_temp) {
-                            char *new_line = str_printf("t%d = mov t%d", def, src_temp);
-                            if (new_line) {
-                                free(ctx->lines[i]);
-                                ctx->lines[i] = new_line;
-                            }
-                            temp_info_clear(&temps[def]);
-                            temps[def].has_copy = 1;
-                            temps[def].copy_temp = src_temp;
-                            reused = 1;
-                        }
-                        break;
-                    }
-                }
-            }
-            if (!reused && key) {
                 if (const_count == const_cap) {
                     int new_cap = const_cap == 0 ? 16 : const_cap * 2;
                     char **new_keys = realloc(const_key, (size_t) new_cap * sizeof(char *));
@@ -4659,9 +7636,6 @@ static void apply_propagation(IRContext *ctx)
                     const_temp[const_count] = def;
                     const_count++;
                 }
-            }
-            if (reused) {
-                continue;
             }
             temp_info_clear(&temps[def]);
             if (ir_const_from_tokens(kind, value, &temps[def].val)) {
@@ -5153,6 +8127,28 @@ static void apply_dead_named_elim(IRContext *ctx)
             }
             continue;
         }
+        if (parse_load_addr(ctx->lines[i], &temp, &addr)) {
+            const char *var = NULL;
+            if (addr_map && addr > 0 && addr <= max_temp) {
+                var = addr_map[addr];
+            }
+            if (var && (name_is_in_set(var, matrix_names, matrix_count) ||
+                        name_is_in_set(var, array_names, array_count))) {
+                if (!name_is_in_set(var, live, live_count)) {
+                    if (live_count == live_cap) {
+                        int new_cap = live_cap == 0 ? 32 : live_cap * 2;
+                        char **next = realloc(live, (size_t) new_cap * sizeof(char *));
+                        if (!next) {
+                            continue;
+                        }
+                        live = next;
+                        live_cap = new_cap;
+                    }
+                    live[live_count++] = strdup(var);
+                }
+            }
+            continue;
+        }
         if (parse_store_line(ctx->lines[i], &addr, &val)) {
             const char *var = NULL;
             if (addr_map && addr > 0 && addr <= max_temp) {
@@ -5161,6 +8157,21 @@ static void apply_dead_named_elim(IRContext *ctx)
             if (var && name_is_in_set(var, scalar_names, scalar_count) &&
                 !name_is_in_set(var, array_names, array_count) &&
                 !name_is_in_set(var, matrix_names, matrix_count)) {
+                if (!name_is_in_set(var, live, live_count)) {
+                    free(ctx->lines[i]);
+                    ctx->lines[i] = NULL;
+                } else {
+                    for (int j = 0; j < live_count; j++) {
+                        if (strcmp(live[j], var) == 0) {
+                            free(live[j]);
+                            live[j] = live[live_count - 1];
+                            live_count--;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (var && name_is_in_set(var, matrix_names, matrix_count)) {
                 if (!name_is_in_set(var, live, live_count)) {
                     free(ctx->lines[i]);
                     ctx->lines[i] = NULL;
@@ -5185,6 +8196,16 @@ static void apply_dead_named_elim(IRContext *ctx)
             if (var && name_is_in_set(var, scalar_names, scalar_count) &&
                 !name_is_in_set(var, array_names, array_count) &&
                 !name_is_in_set(var, matrix_names, matrix_count)) {
+                for (int j = 0; j < live_count; j++) {
+                    if (strcmp(live[j], var) == 0) {
+                        free(live[j]);
+                        live[j] = live[live_count - 1];
+                        live_count--;
+                        break;
+                    }
+                }
+            }
+            if (var && name_is_in_set(var, matrix_names, matrix_count)) {
                 for (int j = 0; j < live_count; j++) {
                     if (strcmp(live[j], var) == 0) {
                         free(live[j]);
@@ -5356,6 +8377,10 @@ static void optimize_ir(IRContext *ctx)
     if (!ctx || !ctx->lines) {
         return;
     }
+    if (ctx->opt_level <= IR_OPT_O0) {
+        ir_run_o0_pipeline(ctx);
+        return;
+    }
     apply_jump_threading(ctx);
     apply_jump_simplify(ctx);
     apply_unreachable_elim(ctx);
@@ -5364,8 +8389,14 @@ static void optimize_ir(IRContext *ctx)
 
 void generate_ir(ASTNode *root, FILE *out)
 {
+    generate_ir_level(root, out, IR_OPT_O1);
+}
+
+void generate_ir_level(ASTNode *root, FILE *out, IROptLevel opt_level)
+{
     IRContext ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.opt_level = opt_level;
     collect_matrix_decls(&ctx, root);
     ctx.capture = 1;
     ir_printf(&ctx, out, "IR_BEGIN");

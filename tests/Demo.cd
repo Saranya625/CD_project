@@ -1,0 +1,7 @@
+Use:
+test_opt_matrix_unroll2.cd : The conditional statements
+test_opt_matrix_unroll3,4.cd : The increase in conditional statements
+test_opt_matrix_inner1.cd : The conditional statements
+test_opt_matrix_diag_mul3.cd, test_opt_matrix_diag_mul4.cd : The conditional statements
+test_opt_matrix_inplace_transpose.cd : The conditional statements
+test_opt_matrix_symmetric_transpose.cd : Same conditional statements, but less mem accesses

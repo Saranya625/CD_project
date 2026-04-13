@@ -1,0 +1,13 @@
+//Test Done
+
+int main() {
+    matrix U[3][3] = {{1,2,3},{0,1,4},{0,0,1}}; // upper triangular, det = 1
+    matrix Inv[3][3];
+    decimal detv;
+
+    detv = U.det;   // det = 1
+
+    print("det:", detv);
+
+    return 0;
+}

@@ -1,0 +1,15 @@
+//Test Done, Show Demo
+
+int main() {
+    matrix a[3][1] = {{1},{2},{3}};
+    matrix b[1][4] = {{10,20,30,40}};
+    matrix c[3][4];
+
+    c = a.mul(b);  // inner dim = 1 -> outer product
+
+    print("c00:", c[0][0]);
+    print("c12:", c[1][2]);
+    print("c23:", c[2][3]);
+
+    return 0;
+}

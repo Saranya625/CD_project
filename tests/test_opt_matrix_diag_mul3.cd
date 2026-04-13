@@ -1,0 +1,14 @@
+//Test Done, Show Demo
+
+int main() {
+    matrix D[3][3] = {{2,0,0},{0,3,0},{0,0,4}};
+    matrix A[3][3] = {{1,2,3},{4,5,6},{7,8,9}};
+    matrix X[3][3];
+    matrix Y[3][3];
+
+    X = D.mul(A); // diagonal x general
+
+    print("x:", X[0][0], X[1][1], X[2][2]);
+
+    return 0;
+}

@@ -1,0 +1,15 @@
+//Wrong Det and Inverse
+
+int main() {
+    matrix D[3][3] = {{2,0,0},{0,3,0},{0,0,4}};
+    matrix Inv[3][3];
+    decimal detv;
+
+    detv = D.det;     // diagonal det -> 2*3*4 = 24
+    Inv = D.inv;      // diagonal inverse
+
+    print("det:", detv);
+    print("inv:", Inv[0][0], Inv[1][1], Inv[2][2]);
+
+    return 0;
+}

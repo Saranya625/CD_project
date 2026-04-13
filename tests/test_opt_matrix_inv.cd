@@ -1,0 +1,14 @@
+//Wrong Det and Inverse
+
+int main() {
+    // Matrix with determinant -1 (integer inverse)
+    matrix a[2][2] = {{1,2},{3,5}};
+    matrix inva[2][2];
+    decimal e = a.det;
+
+    inva = a.inv;
+
+    print("Det:", e);
+    print("inv:", inva[0][0], inva[0][1], inva[1][0], inva[1][1]);
+    return 0;
+}

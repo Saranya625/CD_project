@@ -1,12 +1,191 @@
 IR_BEGIN
-decl int x
-t1 = addr x
-t2 = const int 1
-store [t1], t2
-t3 = addr x
-t4 = load x
-t5 = + t4, t4
-store [t3], t5
-t6 = load x
-print t6
+decl_matrix a, 2, 2
+t1 = const int 0
+t2 = const int 0
+t3 = addr a
+t4 = mul t1, cols(a)
+t5 = add t4, t2
+t6 = mul t5, 4
+t7 = add t3, t6
+t8 = const int 1
+store [t7], t8
+t9 = const int 0
+t10 = const int 1
+t11 = addr a
+t12 = mul t9, cols(a)
+t13 = add t12, t10
+t14 = mul t13, 4
+t15 = add t11, t14
+t16 = const int 2
+store [t15], t16
+t17 = const int 1
+t18 = const int 0
+t19 = addr a
+t20 = mul t17, cols(a)
+t21 = add t20, t18
+t22 = mul t21, 4
+t23 = add t19, t22
+t24 = const int 3
+store [t23], t24
+t25 = const int 1
+t26 = const int 1
+t27 = addr a
+t28 = mul t25, cols(a)
+t29 = add t28, t26
+t30 = mul t29, 4
+t31 = add t27, t30
+t32 = const int 4
+store [t31], t32
+decl_matrix b, 2, 2
+t33 = const int 0
+t34 = const int 0
+t35 = addr b
+t36 = mul t33, cols(b)
+t37 = add t36, t34
+t38 = mul t37, 4
+t39 = add t35, t38
+t40 = const int 5
+store [t39], t40
+t41 = const int 0
+t42 = const int 1
+t43 = addr b
+t44 = mul t41, cols(b)
+t45 = add t44, t42
+t46 = mul t45, 4
+t47 = add t43, t46
+t48 = const int 6
+store [t47], t48
+t49 = const int 1
+t50 = const int 0
+t51 = addr b
+t52 = mul t49, cols(b)
+t53 = add t52, t50
+t54 = mul t53, 4
+t55 = add t51, t54
+t56 = const int 7
+store [t55], t56
+t57 = const int 1
+t58 = const int 1
+t59 = addr b
+t60 = mul t57, cols(b)
+t61 = add t60, t58
+t62 = mul t61, 4
+t63 = add t59, t62
+t64 = const int 8
+store [t63], t64
+decl_matrix c, 2, 2
+decl int mat_r65
+decl int mat_c66
+decl int mat_k67
+decl int mat_acc68
+t69 = addr mat_r65
+t70 = addr mat_c66
+t71 = addr mat_k67
+t72 = addr mat_acc68
+t73 = const int 0
+t74 = const int 1
+t75 = const int 2
+t76 = const int 2
+t77 = const int 2
+t78 = const int 4
+t79 = * t76, t78
+t80 = * t77, t78
+t81 = addr a
+t82 = addr b
+t83 = addr c
+store [t69], t73
+label L1
+t84 = load mat_r65
+t85 = lt t84, t75
+ifz t85 goto L2
+store [t70], t73
+label L3
+t86 = load mat_c66
+t87 = lt t86, t77
+ifz t87 goto L4
+store [t72], t73
+store [t71], t73
+label L5
+t88 = load mat_k67
+t89 = lt t88, t76
+ifz t89 goto L6
+t90 = load mat_r65
+t93 = * t90, t79
+t94 = + t81, t93
+t91 = load mat_c66
+t95 = * t91, t78
+t92 = load mat_k67
+t96 = * t92, t78
+t97 = + t94, t96
+t98 = * t92, t80
+t99 = + t98, t95
+t100 = + t82, t99
+t101 = load [t97]
+t102 = load [t100]
+t103 = * t101, t102
+t104 = load mat_acc68
+t105 = + t104, t103
+store [t72], t105
+t106 = load mat_k67
+t107 = + t106, t74
+store [t71], t107
+goto L5
+label L6
+t108 = load mat_r65
+t111 = * t108, t80
+t112 = + t83, t111
+t109 = load mat_c66
+t113 = * t109, t78
+t110 = load mat_acc68
+t114 = + t112, t113
+store [t114], t110
+t115 = load mat_c66
+t116 = + t115, t74
+store [t70], t116
+goto L3
+label L4
+t117 = load mat_r65
+t118 = + t117, t74
+store [t69], t118
+goto L1
+label L2
+print_str "c:"
+t120 = const int 0
+t121 = const int 0
+t119 = addr c
+t122 = mul t120, cols(c)
+t123 = add t122, t121
+t124 = mul t123, 4
+t125 = add t119, t124
+t126 = load [t125]
+print t126
+t128 = const int 0
+t129 = const int 1
+t127 = addr c
+t130 = mul t128, cols(c)
+t131 = add t130, t129
+t132 = mul t131, 4
+t133 = add t127, t132
+t134 = load [t133]
+print t134
+t136 = const int 1
+t137 = const int 0
+t135 = addr c
+t138 = mul t136, cols(c)
+t139 = add t138, t137
+t140 = mul t139, 4
+t141 = add t135, t140
+t142 = load [t141]
+print t142
+t144 = const int 1
+t145 = const int 1
+t143 = addr c
+t146 = mul t144, cols(c)
+t147 = add t146, t145
+t148 = mul t147, 4
+t149 = add t143, t148
+t150 = load [t149]
+print t150
+t151 = const int 0
+ret t151
 IR_END

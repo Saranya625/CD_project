@@ -1,0 +1,13 @@
+//Test Done
+
+int main() {
+    matrix S[3][3] = {{1,2,3},{2,4,5},{3,5,6}};
+    matrix T[3][3];
+    matrix P[3][3];
+
+    T = S.T;       // symmetric transpose no-op
+
+    print("t:", T[0][1], T[1][0]);
+
+    return 0;
+}
