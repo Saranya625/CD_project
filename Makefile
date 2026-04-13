@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall
 SRC ?= tests/test_opt_matrix_unroll4.cd
-OPT ?= -O1
+OPT ?= -O0
 CREATOR_URL ?= https://creatorsim.github.io/creator/
 
 all: compiler ir2riscv

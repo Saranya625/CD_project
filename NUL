@@ -1,32 +1,3 @@
-	.data
-	.align	2
-
-a:	.space	64
-b:	.space	64
-c:	.space	64
-mat_r257:	.word	0
-mat_c258:	.word	0
-mat_k259:	.word	0
-mat_acc260:	.word	0
-
-t_265:	.word	0
-t_266:	.word	0
-t_267:	.word	0
-t_268:	.word	0
-t_269:	.word	0
-t_270:	.word	0
-t_271:	.word	0
-t_272:	.word	0
-t_277:	.word	0
-t_279:	.word	0
-t_281:	.word	0
-t_343:	.word	0
-
-.Ls0:	.asciz	"c:"
-
-	.text
-	.globl	main
-main:
 	addi	t0, x0, 0
 	addi	t1, x0, 0
 	la	t2, a
@@ -545,7 +516,3 @@ L2:
 	addi	t2, x0, 0
 	la	t6, t_343
 	sw	t2, 0(t6)
-
-.Lexit:
-	addi	a7, x0, 10
-	ecall
