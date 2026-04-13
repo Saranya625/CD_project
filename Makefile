@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall
-SRC ?= tests/test_opt_matrix_unroll2.cd
-OPT ?= -O0
+SRC ?= tests/test_opt_matrix_unroll4.cd
+OPT ?= -O1
 CREATOR_URL ?= https://creatorsim.github.io/creator/
 
 all: compiler ir2riscv
@@ -38,9 +38,9 @@ creator-autopaste: run
 	@if command -v powershell >/dev/null 2>&1; then \
 		powershell -NoProfile -ExecutionPolicy Bypass -File scripts/open_creator.ps1 -AsmFile output.s -CreatorUrl "$(CREATOR_URL)" -AutoPaste; \
 	elif command -v pwsh >/dev/null 2>&1; then \
-		pwsh -NoProfile -File scripts/open_creator.ps1 -AsmFile output.s -CreatorUrl "$(CREATOR_URL)"; \
+		pwsh -NoProfile -File scripts/open_creator.ps1 -AsmFile output.s -CreatorUrl "$(CREATOR_URL)" -AutoPaste; \
 	else \
-		sh scripts/open_creator.sh output.s "$(CREATOR_URL)"; \
+		sh scripts/open_creator.sh output.s "$(CREATOR_URL)" autopaste; \
 	fi
 
 .PHONY: all clean run creator creator-autopaste

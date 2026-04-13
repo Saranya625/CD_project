@@ -1,5 +1,5 @@
 Symbol Table
 ------------
-scope=1 name=a type=matrix rows=2 cols=2
-scope=1 name=b type=matrix rows=2 cols=2
-scope=1 name=c type=matrix rows=2 cols=2
+scope=1 name=a type=matrix rows=4 cols=4
+scope=1 name=b type=matrix rows=4 cols=4
+scope=1 name=c type=matrix rows=4 cols=4

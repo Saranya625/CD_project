@@ -2,6 +2,7 @@
 
 ASM_FILE="${1:-output.s}"
 CREATOR_URL="${2:-https://creatorsim.github.io/creator/}"
+AUTO_PASTE="${3:-}"
 
 if [ ! -f "$ASM_FILE" ]; then
   echo "Error: assembly file not found: $ASM_FILE" >&2
@@ -14,21 +15,34 @@ if [ ! -s "$ASM_FILE" ]; then
 fi
 
 copy_ok=0
+copy_method=""
 if command -v wl-copy >/dev/null 2>&1; then
   wl-copy < "$ASM_FILE"
   copy_ok=1
+  copy_method="wl-copy"
 elif command -v xclip >/dev/null 2>&1; then
   xclip -selection clipboard < "$ASM_FILE"
   copy_ok=1
+  copy_method="xclip"
 elif command -v xsel >/dev/null 2>&1; then
   xsel --clipboard --input < "$ASM_FILE"
   copy_ok=1
+  copy_method="xsel"
 elif command -v pbcopy >/dev/null 2>&1; then
   pbcopy < "$ASM_FILE"
   copy_ok=1
+  copy_method="pbcopy"
 elif command -v clip.exe >/dev/null 2>&1; then
   clip.exe < "$ASM_FILE"
   copy_ok=1
+  copy_method="clip.exe"
+elif command -v base64 >/dev/null 2>&1 && [ -n "${TERM:-}" ]; then
+  # OSC 52 lets many modern terminals place text onto the system clipboard
+  # without requiring wl-copy/xclip/xsel to be installed.
+  osc52_payload=$(base64 < "$ASM_FILE" | tr -d '\r\n')
+  printf '\033]52;c;%s\a' "$osc52_payload"
+  copy_ok=1
+  copy_method="OSC52"
 fi
 
 open_ok=0
@@ -53,7 +67,12 @@ else
 fi
 
 if [ "$copy_ok" -eq 1 ]; then
-  echo "Copied '$ASM_FILE' to clipboard. Click Creator editor and press Ctrl+V."
+  echo "Copied '$ASM_FILE' to clipboard using $copy_method. Click Creator editor and press Ctrl+V."
 else
   echo "No clipboard tool found. Paste manually from file: $ASM_FILE"
+fi
+
+if [ "$AUTO_PASTE" = "autopaste" ]; then
+  echo "Linux auto-paste into the browser is not reliable across desktop environments."
+  echo "The file has been copied when possible; focus Creator and press Ctrl+V."
 fi
