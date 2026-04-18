@@ -1,8 +1,8 @@
 //Wrong Det and Inverse
 
 int main() {
-    // Matrix with determinant -1 (integer inverse)
-    matrix a[2][2] = {{1,2},{3,5}};
+    // Matrix with determinant 1 (integer inverse)
+    matrix a[2][2] = {{2,1},{5,3}};
     matrix inva[2][2];
     decimal e = a.det;
 

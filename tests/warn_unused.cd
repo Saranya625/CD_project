@@ -1,0 +1,13 @@
+int main() {
+    int used;
+    int unused_local;
+    array buf[3];
+    matrix mat[2][2];
+
+    used = 10;
+    buf[0] = used;
+    mat[0][0] = 1;
+    print("value:", buf[0], mat[0][0]);
+
+    return 0;
+}

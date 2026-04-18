@@ -5,53 +5,50 @@
 |   |   |   |   |-- statements
 |   |   |   |   |   |-- statements
 |   |   |   |   |   |   |-- statements
-|   |   |   |   |   |   |   |-- matrix_decl (a)
-|   |   |   |   |   |   |   |   |-- rows (2)
-|   |   |   |   |   |   |   |   |-- cols (2)
-|   |   |   |   |   |   |   |   |-- init_rows
-|   |   |   |   |   |   |   |   |   |-- init_row
-|   |   |   |   |   |   |   |   |   |   |-- init_list
-|   |   |   |   |   |   |   |   |   |   |   |-- int (1)
-|   |   |   |   |   |   |   |   |   |   |   |-- int (2)
-|   |   |   |   |   |   |   |   |   |-- init_row
-|   |   |   |   |   |   |   |   |   |   |-- init_list
-|   |   |   |   |   |   |   |   |   |   |   |-- int (3)
-|   |   |   |   |   |   |   |   |   |   |   |-- int (4)
-|   |   |   |   |   |   |   |-- matrix_decl (b)
-|   |   |   |   |   |   |   |   |-- rows (2)
-|   |   |   |   |   |   |   |   |-- cols (2)
-|   |   |   |   |   |   |   |   |-- init_rows
-|   |   |   |   |   |   |   |   |   |-- init_row
-|   |   |   |   |   |   |   |   |   |   |-- init_list
-|   |   |   |   |   |   |   |   |   |   |   |-- int (5)
-|   |   |   |   |   |   |   |   |   |   |   |-- int (6)
-|   |   |   |   |   |   |   |   |   |-- init_row
-|   |   |   |   |   |   |   |   |   |   |-- init_list
-|   |   |   |   |   |   |   |   |   |   |   |-- int (7)
-|   |   |   |   |   |   |   |   |   |   |   |-- int (8)
-|   |   |   |   |   |   |-- matrix_decl (c)
-|   |   |   |   |   |   |   |-- rows (2)
-|   |   |   |   |   |   |   |-- cols (2)
-|   |   |   |   |   |-- assign (c)
-|   |   |   |   |   |   |-- matmul
-|   |   |   |   |   |   |   |-- id (a)
-|   |   |   |   |   |   |   |-- id (b)
+|   |   |   |   |   |   |   |-- statements
+|   |   |   |   |   |   |   |   |-- matrix_decl (a)
+|   |   |   |   |   |   |   |   |   |-- rows (2)
+|   |   |   |   |   |   |   |   |   |-- cols (2)
+|   |   |   |   |   |   |   |   |   |-- init_rows
+|   |   |   |   |   |   |   |   |   |   |-- init_row
+|   |   |   |   |   |   |   |   |   |   |   |-- init_list
+|   |   |   |   |   |   |   |   |   |   |   |   |-- int (2)
+|   |   |   |   |   |   |   |   |   |   |   |   |-- int (1)
+|   |   |   |   |   |   |   |   |   |   |-- init_row
+|   |   |   |   |   |   |   |   |   |   |   |-- init_list
+|   |   |   |   |   |   |   |   |   |   |   |   |-- int (5)
+|   |   |   |   |   |   |   |   |   |   |   |   |-- int (3)
+|   |   |   |   |   |   |   |   |-- matrix_decl (inva)
+|   |   |   |   |   |   |   |   |   |-- rows (2)
+|   |   |   |   |   |   |   |   |   |-- cols (2)
+|   |   |   |   |   |   |   |-- decl_assign
+|   |   |   |   |   |   |   |   |-- type (decimal)
+|   |   |   |   |   |   |   |   |-- id (e)
+|   |   |   |   |   |   |   |   |-- det
+|   |   |   |   |   |   |   |   |   |-- id (a)
+|   |   |   |   |   |   |-- assign (inva)
+|   |   |   |   |   |   |   |-- inv
+|   |   |   |   |   |   |   |   |-- id (a)
+|   |   |   |   |   |-- print
+|   |   |   |   |   |   |-- print_args
+|   |   |   |   |   |   |   |-- string ("Det:")
+|   |   |   |   |   |   |   |-- id (e)
 |   |   |   |   |-- print
 |   |   |   |   |   |-- print_args
 |   |   |   |   |   |   |-- print_args
 |   |   |   |   |   |   |   |-- print_args
 |   |   |   |   |   |   |   |   |-- print_args
-|   |   |   |   |   |   |   |   |   |-- string ("c:")
-|   |   |   |   |   |   |   |   |   |-- matrix_access (c)
+|   |   |   |   |   |   |   |   |   |-- string ("inv:")
+|   |   |   |   |   |   |   |   |   |-- matrix_access (inva)
 |   |   |   |   |   |   |   |   |   |   |-- int (0)
 |   |   |   |   |   |   |   |   |   |   |-- int (0)
-|   |   |   |   |   |   |   |   |-- matrix_access (c)
+|   |   |   |   |   |   |   |   |-- matrix_access (inva)
 |   |   |   |   |   |   |   |   |   |-- int (0)
 |   |   |   |   |   |   |   |   |   |-- int (1)
-|   |   |   |   |   |   |   |-- matrix_access (c)
+|   |   |   |   |   |   |   |-- matrix_access (inva)
 |   |   |   |   |   |   |   |   |-- int (1)
 |   |   |   |   |   |   |   |   |-- int (0)
-|   |   |   |   |   |   |-- matrix_access (c)
+|   |   |   |   |   |   |-- matrix_access (inva)
 |   |   |   |   |   |   |   |-- int (1)
 |   |   |   |   |   |   |   |-- int (1)
 |   |   |   |-- return

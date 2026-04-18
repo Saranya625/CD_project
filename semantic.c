@@ -24,6 +24,8 @@ typedef struct Symbol {
     int size;
     int rows;
     int cols;
+    int decl_line;
+    int is_used;
     struct Symbol *next;
 } Symbol;
 
@@ -43,6 +45,7 @@ typedef struct ExprInfo {
 
 static Scope *current_scope = NULL;
 static int semantic_errors = 0;
+static int semantic_warnings = 0;
 static FILE *symbol_output = NULL;
 static int current_scope_depth = -1;
 
@@ -122,6 +125,20 @@ static void semantic_error(const char *fmt, ...)
 
     category = classify_semantic_error(message);
     fprintf(stderr, "Semantic error at line %d [%s]: %s\n", line_no, category, message);
+}
+
+static void semantic_warning_at_line(int warn_line, const char *fmt, ...)
+{
+    va_list args;
+    char message[1024];
+
+    semantic_warnings++;
+
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    fprintf(stderr, "Semantic warning at line %d: %s\n", warn_line, message);
 }
 
 static const char *type_name(SymbolType type)
@@ -217,6 +234,9 @@ static void exit_scope(void)
 
     sym = current_scope->symbols;
     while (sym) {
+        if (!sym->is_used && sym->type != SYM_INVALID) {
+            semantic_warning_at_line(sym->decl_line, "unused variable '%s'", sym->name);
+        }
         next = sym->next;
         free(sym->name);
         free(sym);
@@ -270,7 +290,14 @@ static Symbol *lookup_symbol(const char *name)
     return NULL;
 }
 
-static void declare_symbol(const char *name, SymbolType type, int size, int rows, int cols)
+static void mark_symbol_used(Symbol *sym)
+{
+    if (sym) {
+        sym->is_used = 1;
+    }
+}
+
+static void declare_symbol(const char *name, SymbolType type, int size, int rows, int cols, int decl_line)
 {
     Symbol *sym;
     const char *kind = "invalid";
@@ -290,6 +317,8 @@ static void declare_symbol(const char *name, SymbolType type, int size, int rows
     sym->size = size;
     sym->rows = rows;
     sym->cols = cols;
+    sym->decl_line = decl_line;
+    sym->is_used = 0;
     sym->next = current_scope->symbols;
     current_scope->symbols = sym;
 
@@ -518,6 +547,7 @@ static ExprInfo analyze_lvalue(ASTNode *node, int loop_depth, int switch_depth)
             semantic_error("use of undeclared identifier '%s'", node->value ? node->value : "<null>");
             return invalid_info();
         }
+        mark_symbol_used(sym);
         return symbol_to_expr(sym);
     }
 
@@ -531,6 +561,7 @@ static ExprInfo analyze_lvalue(ASTNode *node, int loop_depth, int switch_depth)
             semantic_error("'%s' is not an array", node->value);
             return invalid_info();
         }
+        mark_symbol_used(sym);
 
         index_info = analyze_expression(node->left, loop_depth, switch_depth);
         if (index_info.type != SYM_INVALID && !is_int_like(index_info.type)) {
@@ -550,6 +581,7 @@ static ExprInfo analyze_lvalue(ASTNode *node, int loop_depth, int switch_depth)
             semantic_error("'%s' is not a matrix", node->value);
             return invalid_info();
         }
+        mark_symbol_used(sym);
 
         row_info = analyze_expression(node->left, loop_depth, switch_depth);
         col_info = analyze_expression(node->right, loop_depth, switch_depth);
@@ -585,6 +617,7 @@ static ExprInfo analyze_assignment(ASTNode *node, int loop_depth, int switch_dep
             semantic_error("assignment to undeclared identifier '%s'", node->value);
             lhs = invalid_info();
         } else {
+            mark_symbol_used(sym);
             lhs = symbol_to_expr(sym);
         }
         rhs = analyze_expression(node->left, loop_depth, switch_depth);
@@ -963,13 +996,13 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
 
     if (strcmp(node->type, "decl") == 0) {
         decl_type = parse_declared_scalar_type(node->left ? node->left->value : NULL);
-        declare_symbol(node->right ? node->right->value : NULL, decl_type, -1, -1, -1);
+        declare_symbol(node->right ? node->right->value : NULL, decl_type, -1, -1, -1, node->line);
         return;
     }
 
     if (strcmp(node->type, "decl_assign") == 0) {
         decl_type = parse_declared_scalar_type(node->left ? node->left->value : NULL);
-        declare_symbol(node->right ? node->right->value : NULL, decl_type, -1, -1, -1);
+        declare_symbol(node->right ? node->right->value : NULL, decl_type, -1, -1, -1, node->line);
         expr = analyze_expression(node->third, loop_depth, switch_depth);
         if (!is_assignable(decl_type, expr.type)) {
             semantic_error("type mismatch in initialization of '%s'", node->right ? node->right->value : "<null>");
@@ -980,11 +1013,11 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
     if (strcmp(node->type, "array_decl") == 0) {
         if (!parse_int_literal(node->left ? node->left->value : NULL, &declared_extent)) {
             semantic_error("invalid array size for '%s'", node->value ? node->value : "<null>");
-            declare_symbol(node->value, SYM_ARRAY, -1, -1, -1);
+            declare_symbol(node->value, SYM_ARRAY, -1, -1, -1, node->line);
             return;
         }
 
-        declare_symbol(node->value, SYM_ARRAY, (int) declared_extent, -1, -1);
+        declare_symbol(node->value, SYM_ARRAY, (int) declared_extent, -1, -1, node->line);
         if (declared_extent <= 0) {
             semantic_error("array '%s' size must be positive", node->value);
         }
@@ -1006,11 +1039,11 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
         if (!parse_int_literal(node->left ? node->left->value : NULL, &row_count) ||
             !parse_int_literal(node->right ? node->right->value : NULL, &col_count)) {
             semantic_error("invalid matrix dimensions for '%s'", node->value ? node->value : "<null>");
-            declare_symbol(node->value, SYM_MATRIX, -1, -1, -1);
+            declare_symbol(node->value, SYM_MATRIX, -1, -1, -1, node->line);
             return;
         }
 
-        declare_symbol(node->value, SYM_MATRIX, -1, (int) row_count, (int) col_count);
+        declare_symbol(node->value, SYM_MATRIX, -1, (int) row_count, (int) col_count, node->line);
 
         if (row_count <= 0 || col_count <= 0) {
             semantic_error("matrix '%s' dimensions must be positive", node->value);
@@ -1158,6 +1191,7 @@ static void analyze_node(ASTNode *node, int loop_depth, int switch_depth)
 int semantic_analysis(ASTNode *root_node)
 {
     semantic_errors = 0;
+    semantic_warnings = 0;
     current_scope_depth = -1;
     enter_scope();
     analyze_node(root_node, 0, 0);

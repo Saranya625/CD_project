@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall
-SRC ?= tests/test_opt_matrix_unroll2.cd
+SRC ?= tests/test_opt_matrix_inv.cd
 OPT ?= -O0
 CREATOR_URL ?= https://creatorsim.github.io/creator/
 

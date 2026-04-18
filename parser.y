@@ -689,6 +689,7 @@ ASTNode* createNode(char *type, char *value, ASTNode *left, ASTNode *right, ASTN
     ASTNode *node = malloc(sizeof(ASTNode));
     node->type = type;
     node->value = value;
+    node->line = line_no;
     node->left = left;
     node->right = right;
     node->third = third;

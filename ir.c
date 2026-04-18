@@ -233,9 +233,14 @@ static int emit_matrix_mul_unrolled(IRContext *ctx, const char *dst, const char 
                                     int n, FILE *out);
 static int emit_matrix_det_diag(IRContext *ctx, const char *src, int n, FILE *out);
 
-static int ir_opt_enabled(const IRContext *ctx)
+static int ir_basic_opt_enabled(const IRContext *ctx)
 {
     return ctx && ctx->opt_level >= IR_OPT_O1;
+}
+
+static int ir_matrix_opt_enabled(const IRContext *ctx)
+{
+    return ctx && ctx->opt_level >= IR_OPT_O2;
 }
 
 static int ir_o2_enabled(const IRContext *ctx)
@@ -2642,8 +2647,130 @@ static int emit_matrix_inverse(IRContext *ctx, const char *dst, const char *src,
         int pivot;
         int inv_pivot;
         int one_val;
+        int pivot_var_id = new_temp(ctx);
+        char pivot_var[32];
+        int pivot_addr;
+        int pivot_search_label;
+        int pivot_found_label;
+        int pivot_singular_label;
+        int pivot_after_swap_label;
+
+        snprintf(pivot_var, sizeof(pivot_var), "mat_pivot%d", pivot_var_id);
+        ir_printf(ctx, out, "decl int %s", pivot_var);
+        pivot_addr = new_temp(ctx);
+        ir_printf(ctx, out, "t%d = addr %s", pivot_addr, pivot_var);
 
         ir_printf(ctx, out, "t%d = load %s", i_val, i_var);
+        ir_printf(ctx, out, "store [t%d], t%d", pivot_addr, i_val);
+
+        pivot_search_label = new_label(ctx);
+        pivot_found_label = new_label(ctx);
+        pivot_singular_label = new_label(ctx);
+        pivot_after_swap_label = new_label(ctx);
+
+        ir_printf(ctx, out, "label L%d", pivot_search_label);
+        {
+            int prow = new_temp(ctx);
+            int in_bounds = new_temp(ctx);
+            int addr_chk;
+            int pivot_chk;
+            int pivot_chk_f;
+            int is_zero_pivot;
+            int next_row;
+
+            ir_printf(ctx, out, "t%d = load %s", prow, pivot_var);
+            ir_printf(ctx, out, "t%d = lt t%d, t%d", in_bounds, prow, n_const);
+            ir_printf(ctx, out, "ifz t%d goto L%d", in_bounds, pivot_singular_label);
+
+            addr_chk = emit_matrix_elem_addr(ctx, a_name, prow, i_val, out);
+            pivot_chk = new_temp(ctx);
+            pivot_chk_f = new_temp(ctx);
+            is_zero_pivot = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = load [t%d]", pivot_chk, addr_chk);
+            ir_printf(ctx, out, "t%d = * t%d, t%d", pivot_chk_f, pivot_chk, one_dec);
+            ir_printf(ctx, out, "t%d = eq t%d, t%d", is_zero_pivot, pivot_chk_f, zero_dec);
+            ir_printf(ctx, out, "ifz t%d goto L%d", is_zero_pivot, pivot_found_label);
+
+            next_row = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = + t%d, t%d", next_row, prow, one);
+            ir_printf(ctx, out, "store [t%d], t%d", pivot_addr, next_row);
+            ir_printf(ctx, out, "goto L%d", pivot_search_label);
+        }
+
+        ir_printf(ctx, out, "label L%d", pivot_found_label);
+        {
+            int prow = new_temp(ctx);
+            int same_row = new_temp(ctx);
+            int do_swap_label = new_label(ctx);
+
+            ir_printf(ctx, out, "t%d = load %s", prow, pivot_var);
+            ir_printf(ctx, out, "t%d = eq t%d, t%d", same_row, prow, i_val);
+            ir_printf(ctx, out, "ifz t%d goto L%d", same_row, do_swap_label);
+            ir_printf(ctx, out, "goto L%d", pivot_after_swap_label);
+
+            ir_printf(ctx, out, "label L%d", do_swap_label);
+            ir_printf(ctx, out, "store [t%d], t%d", j_addr, zero);
+            j_label = new_label(ctx);
+            j_end_label = new_label(ctx);
+            ir_printf(ctx, out, "label L%d", j_label);
+            {
+                int j_val = new_temp(ctx);
+                int j_cmp = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+                ir_printf(ctx, out, "t%d = lt t%d, t%d", j_cmp, j_val, n_const);
+                ir_printf(ctx, out, "ifz t%d goto L%d", j_cmp, j_end_label);
+            }
+            {
+                int j_val = new_temp(ctx);
+                int addr_ai;
+                int addr_ap;
+                int addr_di;
+                int addr_dp;
+                int val_ai;
+                int val_ap;
+                int val_di;
+                int val_dp;
+
+                ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+                addr_ai = emit_matrix_elem_addr(ctx, a_name, i_val, j_val, out);
+                addr_ap = emit_matrix_elem_addr(ctx, a_name, prow, j_val, out);
+                addr_di = emit_matrix_elem_addr(ctx, dst, i_val, j_val, out);
+                addr_dp = emit_matrix_elem_addr(ctx, dst, prow, j_val, out);
+
+                val_ai = new_temp(ctx);
+                val_ap = new_temp(ctx);
+                val_di = new_temp(ctx);
+                val_dp = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_ai, addr_ai);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_ap, addr_ap);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_di, addr_di);
+                ir_printf(ctx, out, "t%d = load [t%d]", val_dp, addr_dp);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_ai, val_ap);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_ap, val_ai);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_di, val_dp);
+                ir_printf(ctx, out, "store [t%d], t%d", addr_dp, val_di);
+            }
+            {
+                int j_val = new_temp(ctx);
+                int j_next = new_temp(ctx);
+                ir_printf(ctx, out, "t%d = load %s", j_val, j_var);
+                ir_printf(ctx, out, "t%d = + t%d, t%d", j_next, j_val, one);
+                ir_printf(ctx, out, "store [t%d], t%d", j_addr, j_next);
+            }
+            ir_printf(ctx, out, "goto L%d", j_label);
+            ir_printf(ctx, out, "label L%d", j_end_label);
+            ir_printf(ctx, out, "goto L%d", pivot_after_swap_label);
+        }
+
+        ir_printf(ctx, out, "label L%d", pivot_singular_label);
+        {
+            int done_val = new_temp(ctx);
+            ir_printf(ctx, out, "t%d = const int %d", done_val, n);
+            ir_printf(ctx, out, "store [t%d], t%d", i_addr, done_val);
+            ir_printf(ctx, out, "goto L%d", i_end_label);
+        }
+
+        ir_printf(ctx, out, "label L%d", pivot_after_swap_label);
         addr_pivot = emit_matrix_elem_addr(ctx, a_name, i_val, i_val, out);
         pivot = new_temp(ctx);
         ir_printf(ctx, out, "t%d = load [t%d]", pivot, addr_pivot);
@@ -3098,7 +3225,7 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
             }
         }
     }
-    if (ir_opt_enabled(ctx) && eval_const_expr(ctx, node, &folded)) {
+    if (ir_basic_opt_enabled(ctx) && eval_const_expr(ctx, node, &folded)) {
         int temp = emit_const_value(ctx, &folded, out);
         if (cse_enabled && cache && key && temp >= 0) {
             expr_cache_add(cache, key, temp);
@@ -3174,8 +3301,8 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
         strcmp(node->type, "and") == 0 || strcmp(node->type, "or") == 0) {
         ConstVal left_val;
         ConstVal right_val;
-        int left_is_const = ir_opt_enabled(ctx) && eval_const_expr(ctx, node->left, &left_val);
-        int right_is_const = ir_opt_enabled(ctx) && eval_const_expr(ctx, node->right, &right_val);
+        int left_is_const = ir_basic_opt_enabled(ctx) && eval_const_expr(ctx, node->left, &left_val);
+        int right_is_const = ir_basic_opt_enabled(ctx) && eval_const_expr(ctx, node->right, &right_val);
 
         if ((strcmp(node->type, "+") == 0 || strcmp(node->type, "*") == 0) &&
             left_is_const && !right_is_const) {
@@ -3421,7 +3548,7 @@ static int emit_expr_internal(IRContext *ctx, ASTNode *node, FILE *out, ExprCach
 
 static int emit_expr(IRContext *ctx, ASTNode *node, FILE *out)
 {
-    return emit_expr_internal(ctx, node, out, &ctx->cse_cache, ir_opt_enabled(ctx));
+    return emit_expr_internal(ctx, node, out, &ctx->cse_cache, ir_basic_opt_enabled(ctx));
 }
 
 static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
@@ -3454,7 +3581,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     rows = src_info->rows;
                     cols = src_info->cols;
                 }
-                if (ir_opt_enabled(ctx) &&
+                if (ir_matrix_opt_enabled(ctx) &&
                     src_info && src_name && strcmp(node->value, src_name) == 0 &&
                     rows > 0 && cols > 0 && rows == cols) {
                     if (emit_matrix_transpose_inplace(ctx, node->value, rows, out)) {
@@ -3478,7 +3605,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     rows = src_info->cols;
                     cols = src_info->rows;
                 }
-                if (ir_opt_enabled(ctx) &&
+                if (ir_matrix_opt_enabled(ctx) &&
                     src_info && src_name && strcmp(node->value, src_name) == 0 &&
                     rows > 0 && cols > 0 && rows == cols) {
                     if (emit_matrix_transpose_inplace(ctx, node->value, rows, out)) {
@@ -3492,14 +3619,14 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                         return;
                     }
                 }
-                if (ir_opt_enabled(ctx) && src_info && rows == 1 && cols == 1) {
+                if (ir_matrix_opt_enabled(ctx) && src_info && rows == 1 && cols == 1) {
                     if (emit_matrix_scalar_copy(ctx, node->value, src_name, out)) {
                         matrix_props_copy(lhs_info, src_info);
                         matrix_invalidate_name(ctx, node->value);
                         return;
                     }
                 }
-                if (ir_opt_enabled(ctx) && src_info && matrix_is_symmetric(src_info)) {
+                if (ir_matrix_opt_enabled(ctx) && src_info && matrix_is_symmetric(src_info)) {
                     if (src_name && strcmp(node->value, src_name) == 0) {
                         matrix_props_copy(lhs_info, src_info);
                         matrix_invalidate_name(ctx, node->value);
@@ -3541,7 +3668,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                 MatrixInfo *src_info = find_matrix_info(ctx, src_name);
                 if (src_info && src_info->rows > 0 && src_info->cols > 0 && src_info->rows == src_info->cols) {
                     char *inv_key = NULL;
-                    if (ir_opt_enabled(ctx) && src_name) {
+                    if (ir_matrix_opt_enabled(ctx) && src_name) {
                         inv_key = mat_unary_key("inv", src_name);
                         if (inv_key) {
                             MatExprCache *hit = mat_cache_find(ctx->mat_cse_cache, inv_key);
@@ -3564,7 +3691,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     }
                     if (emit_matrix_inverse(ctx, node->value, src_name, src_info->rows, out)) {
                         matrix_props_unknown(lhs_info);
-                        if (ir_opt_enabled(ctx) && inv_key) {
+                        if (ir_matrix_opt_enabled(ctx) && inv_key) {
                             mat_cache_add(&ctx->mat_cse_cache, inv_key, node->value);
                             inv_key = NULL;
                         }
@@ -3576,7 +3703,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
             }
             if (strcmp(rhs_node->type, "matadd") == 0 || strcmp(rhs_node->type, "matsub") == 0 ||
                 strcmp(rhs_node->type, "matmul") == 0) {
-                if (ir_opt_enabled(ctx) &&
+                if (ir_matrix_opt_enabled(ctx) &&
                     strcmp(rhs_node->type, "matadd") == 0 &&
                     rhs_node->left && rhs_node->left->type &&
                     strcmp(rhs_node->left->type, "matadd") == 0) {
@@ -3609,7 +3736,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                 MatrixInfo *left_info = find_matrix_info(ctx, left_name);
                 MatrixInfo *right_info = find_matrix_info(ctx, right_name);
                 if (left_info && right_info) {
-                    if (ir_opt_enabled(ctx)) {
+                    if (ir_matrix_opt_enabled(ctx)) {
                         char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                         MatExprCache *hit = key ? mat_cache_find(ctx->mat_cse_cache, key) : NULL;
                         if (hit && hit->name) {
@@ -3632,7 +3759,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                         }
                     }
                     if (strcmp(rhs_node->type, "matmul") == 0) {
-                        if (ir_opt_enabled(ctx) &&
+                        if (ir_matrix_opt_enabled(ctx) &&
                             left_info->rows == 1 && left_info->cols == 1 &&
                             right_info->rows == 1 && right_info->cols == 1) {
                             if (emit_matrix_scalar_binop(ctx, node->value, left_name, right_name, "*", out)) {
@@ -3641,7 +3768,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) && matrix_is_diagonal(left_info)) {
+                        if (ir_matrix_opt_enabled(ctx) && matrix_is_diagonal(left_info)) {
                             if (emit_matrix_mul_diag_left(ctx, node->value, left_name, right_name,
                                                           left_info->rows, right_info->cols, out)) {
                                 if (matrix_is_diagonal(right_info)) {
@@ -3649,7 +3776,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 } else {
                                     matrix_props_unknown(lhs_info);
                                 }
-                                if (ir_opt_enabled(ctx)) {
+                                if (ir_matrix_opt_enabled(ctx)) {
                                     char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                                     mat_cache_add(&ctx->mat_cse_cache, key, node->value);
                                 }
@@ -3657,7 +3784,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) && matrix_is_diagonal(right_info)) {
+                        if (ir_matrix_opt_enabled(ctx) && matrix_is_diagonal(right_info)) {
                             if (emit_matrix_mul_diag_right(ctx, node->value, left_name, right_name,
                                                            left_info->rows, right_info->cols, out)) {
                                 if (matrix_is_diagonal(left_info)) {
@@ -3665,7 +3792,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 } else {
                                     matrix_props_unknown(lhs_info);
                                 }
-                                if (ir_opt_enabled(ctx)) {
+                                if (ir_matrix_opt_enabled(ctx)) {
                                     char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                                     mat_cache_add(&ctx->mat_cse_cache, key, node->value);
                                 }
@@ -3673,12 +3800,12 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) &&
+                        if (ir_matrix_opt_enabled(ctx) &&
                             left_name && right_name && strcmp(left_name, right_name) == 0 &&
                             matrix_is_symmetric(left_info) && strcmp(node->value, left_name) != 0) {
                             if (emit_matrix_mul_sym_self(ctx, node->value, left_name, left_info->rows, out)) {
                                 matrix_props_set(lhs_info, 1, 0, 0, 0, 1, 0, 0);
-                                if (ir_opt_enabled(ctx)) {
+                                if (ir_matrix_opt_enabled(ctx)) {
                                     char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                                     mat_cache_add(&ctx->mat_cse_cache, key, node->value);
                                 }
@@ -3686,7 +3813,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) &&
+                        if (ir_matrix_opt_enabled(ctx) &&
                             (matrix_is_zero(left_info) || matrix_is_zero(right_info))) {
                             if (emit_matrix_zero_fill(ctx, node->value, left_info->rows, right_info->cols, out)) {
                                 matrix_props_set(lhs_info, 1, 1, 0, 1, 1, 1, 1);
@@ -3694,21 +3821,21 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) && matrix_is_identity(left_info)) {
+                        if (ir_matrix_opt_enabled(ctx) && matrix_is_identity(left_info)) {
                             if (emit_matrix_copy(ctx, node->value, right_name, left_info->rows, right_info->cols, out)) {
                                 matrix_props_copy(lhs_info, right_info);
                                 matrix_invalidate_name(ctx, node->value);
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) && matrix_is_identity(right_info)) {
+                        if (ir_matrix_opt_enabled(ctx) && matrix_is_identity(right_info)) {
                             if (emit_matrix_copy(ctx, node->value, left_name, left_info->rows, left_info->cols, out)) {
                                 matrix_props_copy(lhs_info, left_info);
                                 matrix_invalidate_name(ctx, node->value);
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) && left_info->cols == 1 && right_info->rows == 1) {
+                        if (ir_matrix_opt_enabled(ctx) && left_info->cols == 1 && right_info->rows == 1) {
                             if (emit_matrix_mul_inner1(ctx, node->value, left_name, right_name,
                                                        left_info->rows, right_info->cols, out)) {
                                 matrix_props_unknown(lhs_info);
@@ -3716,7 +3843,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) &&
+                        if (ir_matrix_opt_enabled(ctx) &&
                             left_info->rows == left_info->cols &&
                             left_info->rows == right_info->rows &&
                             right_info->rows == right_info->cols &&
@@ -3736,7 +3863,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                                                left_info->rows, left_info->cols,
                                                                right_info->cols, out)) {
                                 matrix_props_unknown(lhs_info);
-                                if (ir_opt_enabled(ctx)) {
+                                if (ir_matrix_opt_enabled(ctx)) {
                                     char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                                     mat_cache_add(&ctx->mat_cse_cache, key, node->value);
                                 }
@@ -3746,13 +3873,13 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                         }
                         if (emit_matrix_mul(ctx, node->value, left_name, right_name,
                                             left_info->rows, left_info->cols, right_info->cols, out)) {
-                            if (ir_opt_enabled(ctx) &&
+                            if (ir_matrix_opt_enabled(ctx) &&
                                 matrix_is_diagonal(left_info) && matrix_is_diagonal(right_info)) {
                                 matrix_props_set(lhs_info, 1, 0, 0, 1, 1, 1, 1);
                             } else {
                                 matrix_props_unknown(lhs_info);
                             }
-                            if (ir_opt_enabled(ctx)) {
+                            if (ir_matrix_opt_enabled(ctx)) {
                                 char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                                 mat_cache_add(&ctx->mat_cse_cache, key, node->value);
                             }
@@ -3760,7 +3887,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                             return;
                         }
                     } else {
-                        if (ir_opt_enabled(ctx) &&
+                        if (ir_matrix_opt_enabled(ctx) &&
                             left_info->rows == 1 && left_info->cols == 1 &&
                             right_info->rows == 1 && right_info->cols == 1) {
                             const char *op = (strcmp(rhs_node->type, "matadd") == 0) ? "+" : "-";
@@ -3770,14 +3897,14 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) && matrix_is_zero(right_info)) {
+                        if (ir_matrix_opt_enabled(ctx) && matrix_is_zero(right_info)) {
                             if (emit_matrix_copy(ctx, node->value, left_name, left_info->rows, left_info->cols, out)) {
                                 matrix_props_copy(lhs_info, left_info);
                                 matrix_invalidate_name(ctx, node->value);
                                 return;
                             }
                         }
-                        if (ir_opt_enabled(ctx) &&
+                        if (ir_matrix_opt_enabled(ctx) &&
                             strcmp(rhs_node->type, "matadd") == 0 && matrix_is_zero(left_info)) {
                             if (emit_matrix_copy(ctx, node->value, right_name, right_info->rows, right_info->cols, out)) {
                                 matrix_props_copy(lhs_info, right_info);
@@ -3788,23 +3915,23 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                         const char *op = (strcmp(rhs_node->type, "matadd") == 0) ? "+" : "-";
                         if (emit_matrix_add_sub(ctx, node->value, left_name, right_name,
                                                 left_info->rows, left_info->cols, op, out)) {
-                            if (ir_opt_enabled(ctx) &&
+                            if (ir_matrix_opt_enabled(ctx) &&
                                 matrix_is_diagonal(left_info) && matrix_is_diagonal(right_info)) {
                                 int is_zero = matrix_is_zero(left_info) && matrix_is_zero(right_info);
                                 matrix_props_set(lhs_info, 1, is_zero, 0, 1, 1, 1, 1);
-                            } else if (ir_opt_enabled(ctx) &&
+                            } else if (ir_matrix_opt_enabled(ctx) &&
                                        matrix_is_symmetric(left_info) && matrix_is_symmetric(right_info)) {
                                 matrix_props_set(lhs_info, 1, 0, 0, 0, 1, 0, 0);
-                            } else if (ir_opt_enabled(ctx) &&
+                            } else if (ir_matrix_opt_enabled(ctx) &&
                                        matrix_is_upper_triangular(left_info) && matrix_is_upper_triangular(right_info)) {
                                 matrix_props_set(lhs_info, 1, 0, 0, 0, 0, 1, 0);
-                            } else if (ir_opt_enabled(ctx) &&
+                            } else if (ir_matrix_opt_enabled(ctx) &&
                                        matrix_is_lower_triangular(left_info) && matrix_is_lower_triangular(right_info)) {
                                 matrix_props_set(lhs_info, 1, 0, 0, 0, 0, 0, 1);
                             } else {
                                 matrix_props_unknown(lhs_info);
                             }
-                            if (ir_opt_enabled(ctx)) {
+                            if (ir_matrix_opt_enabled(ctx)) {
                                 char *key = mat_expr_key(rhs_node->type, left_name, right_name);
                                 mat_cache_add(&ctx->mat_cse_cache, key, node->value);
                             }
@@ -3822,7 +3949,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     rows = rhs_info->rows;
                     cols = rhs_info->cols;
                 }
-                if (ir_opt_enabled(ctx) && rhs_info && rows == 1 && cols == 1) {
+                if (ir_matrix_opt_enabled(ctx) && rhs_info && rows == 1 && cols == 1) {
                     if (emit_matrix_scalar_copy(ctx, node->value, rhs_node->value, out)) {
                         matrix_props_copy(lhs_info, rhs_info);
                         matrix_invalidate_name(ctx, node->value);
@@ -3875,7 +4002,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
             if (src_info && src_info->rows > 0 && src_info->cols > 0 && src_info->rows == src_info->cols) {
                 int det_temp = -1;
                 char *key = expr_key(rhs_node);
-                if (ir_opt_enabled(ctx) && key) {
+                if (ir_matrix_opt_enabled(ctx) && key) {
                     ExprCache *hit = expr_cache_find(ctx->cse_cache, key);
                     if (hit) {
                         ASTNode id_node;
@@ -3893,9 +4020,9 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                         return;
                     }
                 }
-                if (ir_opt_enabled(ctx) && matrix_is_identity(src_info)) {
+                if (ir_matrix_opt_enabled(ctx) && matrix_is_identity(src_info)) {
                     det_temp = emit_const(ctx, "int", "1", out);
-                } else if (ir_opt_enabled(ctx) &&
+                } else if (ir_matrix_opt_enabled(ctx) &&
                            (matrix_is_diagonal(src_info) ||
                             matrix_is_upper_triangular(src_info) ||
                             matrix_is_lower_triangular(src_info))) {
@@ -3911,7 +4038,7 @@ static void emit_assignment(IRContext *ctx, ASTNode *node, FILE *out)
                     id_node.value = node->value;
                     addr = emit_lvalue_addr(ctx, &id_node, out);
                     ir_printf(ctx, out, "store [t%d], t%d", addr, det_temp);
-                    if (ir_opt_enabled(ctx) && key) {
+                    if (ir_matrix_opt_enabled(ctx) && key) {
                         expr_cache_add(&ctx->cse_cache, key, det_temp);
                         key = NULL;
                     }
@@ -8381,6 +8508,14 @@ static void optimize_ir(IRContext *ctx)
         ir_run_o0_pipeline(ctx);
         return;
     }
+
+    if (ctx->opt_level == IR_OPT_O1) {
+        /* O1 keeps only basic arithmetic-oriented simplification passes. */
+        apply_propagation(ctx);
+        return;
+    }
+
+    /* O2 adds control-flow and unreachable-code cleanups on top of O1. */
     apply_jump_threading(ctx);
     apply_jump_simplify(ctx);
     apply_unreachable_elim(ctx);
@@ -8416,3 +8551,4 @@ void generate_ir_level(ASTNode *root, FILE *out, IROptLevel opt_level)
     cse_clear(&ctx);
     ir_lines_free(&ctx);
 }
+

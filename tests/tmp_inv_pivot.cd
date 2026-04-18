@@ -1,0 +1,7 @@
+int main() {
+    matrix a[2][2] = {{0,1},{1,0}};
+    matrix inva[2][2];
+    inva = a.inv;
+    print(inva[0][0], inva[0][1], inva[1][0], inva[1][1]);
+    return 0;
+}

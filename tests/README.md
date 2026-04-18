@@ -14,6 +14,9 @@
 - `error_runtime_semantic.cd`: should emit `Runtime Semantic Error` (`10 / 0`, compile-time bounds failure).
 - `error_logical.cd`: should emit `Logical Error` (always-true `if`, never-executed `for`).
 
+## Warning case
+- `warn_unused.cd`: should emit a semantic warning for `unused_local` and still succeed compilation.
+
 Run all tests:
 
 ```bash
