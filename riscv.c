@@ -132,12 +132,8 @@ static const char *g_rnames[REG_POOL] = {
     "t0","t1","t2","t3","t4","t5"
 };
 static const char *g_frnames[FREG_POOL] = {
-    "ft1","ft2","ft3","ft4","ft5","ft6","ft7","fa1"
+    "ft0","ft1","ft2","ft3","ft4","ft5","ft6","ft7"
 };
-
-/* ================================================================== */
-/*  Generic helpers                                                     */
-/* ================================================================== */
 
 static const char *skip_ws(const char *s)
 {
@@ -1120,8 +1116,11 @@ static void emit_one(const char *ln, FILE *out)
     /* ── ifz tA goto LN ─────────────────────────────────────────── */
     if (sscanf(ln,"ifz t%d goto L%d",&src,&label)==2) {
         const char *r=ld_tmp(src,out);
+        char rbuf[8];
+        strncpy(rbuf, r, sizeof(rbuf) - 1);
+        rbuf[sizeof(rbuf) - 1] = '\0';
         rc_flush(out);
-        fprintf(out,"\tbeqz\t%s, L%d\n",r,label);
+        fprintf(out,"\tbeqz\t%s, L%d\n",rbuf,label);
         return;
     }
 
@@ -1179,7 +1178,7 @@ static void emit_one(const char *ln, FILE *out)
         int base = (addr > 0 && addr <= MAX_TEMPS) ? g_taddr_base[addr] : -1;
         int target_is_float = (base >= 0 && base < g_nsyms && g_syms[base].mem_is_float);
         if (g_tkind[val] == TK_FLOAT || target_is_float) {
-            const char *rv = ld_tmp_f_operand(val, "ft8", out);
+            const char *rv = ld_tmp_f_operand(val, "fa0", out);
             fprintf(out,"\tfsw\t%s, 0(a5)\n",rv);
         } else {
             const char *rv=ld_tmp(val, out);
@@ -1263,11 +1262,13 @@ static void emit_one(const char *ln, FILE *out)
     /* ── tN = mov tM ─────────────────────────────────────────────── */
     if (sscanf(ln,"t%d = mov t%d",&def,&src)==2) {
         if (g_tkind[def] == TK_FLOAT) {
+            int slot = fc_alloc(def, out);
+            const char *rd = g_frnames[slot];
             g_fconst_known[def] = g_fconst_known[src];
             if (g_fconst_known[def]) g_fconst_bits[def] = g_fconst_bits[src];
-            const char *rs=ld_tmp_f_operand(src, "ft8", out);
-            fprintf(out,"\tfsgnj.s\tft0, %s, %s\n",rs,rs);
-            st_tmp_f(def, "ft0", out);
+            const char *rs=ld_tmp_f_operand(src, "fa0", out);
+            fprintf(out,"\tfsgnj.s\t%s, %s, %s\n",rd,rs,rs);
+            st_tmp_f(def, rd, out);
         } else {
             const char *rs=ld_tmp(src,out);
             int slot=rc_alloc(def, out);
@@ -1330,27 +1331,29 @@ static void emit_one(const char *ln, FILE *out)
     /* ── tN = <op> tA, tB ────────────────────────────────────────── */
     if (sscanf(ln,"t%d = %31s t%d, t%d",&def,op,&lhs,&rhs)==4) {
         if (g_tkind[def] == TK_FLOAT) {
+            int slot = fc_alloc(def, out);
+            const char *rd = g_frnames[slot];
             g_fconst_known[def] = 0;
-            const char *r1 = ld_tmp_f_operand(lhs, "ft8", out);
-            const char *r2 = ld_tmp_f_operand(rhs, "ft9", out);
+            const char *r1 = ld_tmp_f_operand(lhs, "fa0", out);
+            const char *r2 = ld_tmp_f_operand(rhs, "fa1", out);
 
             if      (!strcmp(op,"+")||!strcmp(op,"add"))
-                fprintf(out,"\tfadd.s\tft0, %s, %s\n",r1,r2);
+                fprintf(out,"\tfadd.s\t%s, %s, %s\n",rd,r1,r2);
             else if (!strcmp(op,"-")||!strcmp(op,"sub"))
-                fprintf(out,"\tfsub.s\tft0, %s, %s\n",r1,r2);
+                fprintf(out,"\tfsub.s\t%s, %s, %s\n",rd,r1,r2);
             else if (!strcmp(op,"*")||!strcmp(op,"mul"))
-                fprintf(out,"\tfmul.s\tft0, %s, %s\n",r1,r2);
+                fprintf(out,"\tfmul.s\t%s, %s, %s\n",rd,r1,r2);
             else if (!strcmp(op,"/"))
-                fprintf(out,"\tfdiv.s\tft0, %s, %s\n",r1,r2);
+                fprintf(out,"\tfdiv.s\t%s, %s, %s\n",rd,r1,r2);
             else
                 return;
-            st_tmp_f(def, "ft0", out);
+            st_tmp_f(def, rd, out);
             return;
         }
 
         if (g_tkind[lhs] == TK_FLOAT || g_tkind[rhs] == TK_FLOAT) {
-            const char *r1 = ld_tmp_f_operand(lhs, "ft8", out);
-            const char *r2 = ld_tmp_f_operand(rhs, "ft9", out);
+            const char *r1 = ld_tmp_f_operand(lhs, "fa0", out);
+            const char *r2 = ld_tmp_f_operand(rhs, "fa1", out);
             int slot = rc_alloc(def, out);
             const char *rd = g_rnames[slot];
 
@@ -1472,11 +1475,13 @@ static void emit_one(const char *ln, FILE *out)
     /* ── tN = <op> tA  (unary) ──────────────────────────────────── */
     if (sscanf(ln,"t%d = %31s t%d",&def,op,&src)==3) {
         if (g_tkind[def] == TK_FLOAT) {
+            int slot = fc_alloc(def, out);
+            const char *rd = g_frnames[slot];
             g_fconst_known[def] = 0;
-            const char *rs=ld_tmp_f_operand(src, "ft8", out);
-            if (!strcmp(op,"uminus"))fprintf(out,"\tfneg.s\tft0, %s\n",rs);
+            const char *rs=ld_tmp_f_operand(src, "fa0", out);
+            if (!strcmp(op,"uminus"))fprintf(out,"\tfneg.s\t%s, %s\n",rd,rs);
             else return;
-            st_tmp_f(def, "ft0", out);
+            st_tmp_f(def, rd, out);
         } else {
             const char *rs=ld_tmp(src,out);
             int slot=rc_alloc(def, out);

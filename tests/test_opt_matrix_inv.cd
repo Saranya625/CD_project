@@ -1,4 +1,3 @@
-//Wrong Det and Inverse
 
 int main() {
     // Matrix with determinant 1 (integer inverse)

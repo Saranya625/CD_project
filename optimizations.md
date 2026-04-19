@@ -362,7 +362,6 @@ P = S.mul(S);   // upper triangle only, mirrored
 9. Symmetric detection + symmetric self-mul shortcut.
 10. Triangular det and triangular inverse.
 11. Dead matrix store elimination.
-12. CSE for det and inv.
 
 ---
 

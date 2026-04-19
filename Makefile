@@ -1,16 +1,25 @@
 CC = gcc
 CFLAGS = -Wall
-SRC ?= tests/test_opt_matrix_inv.cd
-OPT ?= -O0
+SRC ?= tests/test_opt_matrix_unroll4.cd
+OPT ?= -O2
 CREATOR_URL ?= https://creatorsim.github.io/creator/
 
-all: compiler ir2riscv
+ifeq ($(OS),Windows_NT)
+EXEEXT := .exe
+else
+EXEEXT :=
+endif
 
-compiler: parser.tab.c lex.yy.c semantic.c semantic.h ir.c ir_o0.c ir_o2.c ir.h ir_internal.h
-	$(CC) $(CFLAGS) -o compiler parser.tab.c lex.yy.c semantic.c ir.c ir_o0.c ir_o2.c
+COMPILER_BIN := compiler$(EXEEXT)
+IR2RISCV_BIN := ir2riscv$(EXEEXT)
 
-ir2riscv: riscv.c
-	$(CC) $(CFLAGS) -o ir2riscv riscv.c
+all: $(COMPILER_BIN) $(IR2RISCV_BIN)
+
+$(COMPILER_BIN): parser.tab.c lex.yy.c semantic.c semantic.h ir.c ir_o0.c ir_o2.c ir.h ir_internal.h
+	$(CC) $(CFLAGS) -o $(COMPILER_BIN) parser.tab.c lex.yy.c semantic.c ir.c ir_o0.c ir_o2.c
+
+$(IR2RISCV_BIN): riscv.c
+	$(CC) $(CFLAGS) -o $(IR2RISCV_BIN) riscv.c
 
 parser.tab.c parser.tab.h: parser.y
 	bison -d parser.y
@@ -19,11 +28,15 @@ lex.yy.c: lexer.l parser.tab.h
 	flex lexer.l
 
 clean:
-	rm -f compiler ir2riscv lex.yy.c parser.tab.c parser.tab.h
+ifeq ($(OS),Windows_NT)
+	-del /Q /F compiler compiler.exe ir2riscv ir2riscv.exe 2>NUL
+else
+	rm -f compiler compiler.exe ir2riscv ir2riscv.exe
+endif
 
 run: all
-	./compiler $(OPT) < $(SRC)
-	./ir2riscv output.ir output.s
+	./$(COMPILER_BIN) $(OPT) < $(SRC)
+	./$(IR2RISCV_BIN) output.ir output.s
 
 creator: run
 	@if command -v powershell >/dev/null 2>&1; then \

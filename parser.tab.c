@@ -2504,7 +2504,7 @@ void yyerror(const char *s) {
 int main(int argc, char **argv) {
     int parse_ok;
     int semantic_ok = 0;
-    IROptLevel opt_level = IR_OPT_O1;
+    IROptLevel opt_level = IR_OPT_O0;
     FILE *tokens_out = NULL;
     FILE *ast_out = NULL;
     FILE *symbol_out = NULL;
